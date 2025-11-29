@@ -1,0 +1,9 @@
+Use the provided product image as the main object in the composition.
+Ensure the final image is Pinterest-ready: visually appealing, clean, and photorealistic.
+
+Instructions:
+- Keep the product clear and proportional to the original reference image.
+- Remove any text, watermarks, or annotations.
+- Create a realistic scene that complements the product style.
+- Maintain ultra-high quality, cinematic lighting, and realistic texture.
+- The final image should have a Pinterest aspect ratio and no measurement lines or labels.

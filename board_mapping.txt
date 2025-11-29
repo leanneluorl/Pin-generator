@@ -1,0 +1,10 @@
+1: Warm & Cozy Living
+2: Minimal Serenity
+3: Zen & Study Retreat
+4: Art & Shadows
+5: Timeless Classics
+6: Minimal Serenity
+7: Zen & Study Retreat
+8: Warm & Cozy Living
+9: Art & Shadows
+10: Warm & Cozy Living
