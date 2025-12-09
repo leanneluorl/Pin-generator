@@ -120,28 +120,106 @@ def get_col_value(row, col_key):
             return row[alias]
     return None
 
-def call_api_with_retry(api_func, *args, max_retries=3, **kwargs):
+def call_api_with_retry(api_func, *args, retry_settings=None, **kwargs):
+    """
+    呼叫 API 並帶有重試機制，讀取 Config 中的設定
+    """
+    # 預設值
+    max_retries = 3
+    initial_backoff = 5
+    
+    # 從 settings 讀取
+    if retry_settings:
+        max_retries = retry_settings.get('max_retries', 3)
+        initial_backoff = retry_settings.get('retry_backoff', 5)
+
     attempt = 0
     while attempt <= max_retries:
         try:
             return api_func(*args, **kwargs)
         except Exception as e:
             error_str = str(e).lower()
+            # 針對 Rate Limit (429) 或 Resource Exhausted 進行重試
             if "429" in error_str or "resource_exhausted" in error_str:
                 attempt += 1
-                time.sleep(5 * attempt)
-                log(f"⚠️ API Busy, retrying ({attempt}/{max_retries})...")
+                if attempt > max_retries:
+                    raise e # 超過次數，拋出錯誤
+                
+                wait_time = initial_backoff * attempt # 線性或指數退避
+                log(f"⚠️ API Busy (429), retrying ({attempt}/{max_retries}) in {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                raise e
+                raise e # 其他錯誤直接拋出
+
+def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
+    """
+    🔥 檢查當前模型是否支援選定的長寬比
+    """
+    if ratios_df.empty:
+        return "1:1"
+
+    row = ratios_df[ratios_df['aspect_ratio'].astype(str).str.strip() == str(current_ratio).strip()]
+    
+    if row.empty:
+        return current_ratio
+
+    supported_models_str = str(row.iloc[0].get('supported_models', 'All')).lower().strip()
+    
+    is_compatible = False
+    model_lower = model_name.lower()
+
+    if 'all' in supported_models_str:
+        is_compatible = True
+    elif 'gemini' in supported_models_str and 'gemini' in model_lower:
+        is_compatible = True
+    elif 'imagen' in supported_models_str and 'imagen' in model_lower:
+        is_compatible = True
+    if 'gemini only' in supported_models_str and 'imagen' in model_lower:
+        is_compatible = False
+    
+    if is_compatible:
+        return current_ratio
+
+    print(f"\n⚠️  CONFLICT: Ratio '{current_ratio}' is marked as '{row.iloc[0]['supported_models']}',")
+    print(f"    but you selected model: '{model_name}'.")
+    print("\n👉  Please select a compatible Aspect Ratio:")
+
+    valid_options = []
+    for _, r_row in ratios_df.iterrows():
+        s_str = str(r_row.get('supported_models', 'All')).lower()
+        opt_compatible = False
+        if 'all' in s_str: opt_compatible = True
+        elif 'gemini' in s_str and 'gemini' in model_lower: opt_compatible = True
+        elif 'imagen' in s_str and 'imagen' in model_lower: opt_compatible = True
+        
+        if opt_compatible:
+            valid_options.append(str(r_row['aspect_ratio']))
+
+    for i, opt in enumerate(valid_options):
+        print(f"   [{i+1}] {opt}")
+    print("   [Q] Quit")
+
+    while True:
+        choice = input("👉 Select Option (Number): ").strip().lower()
+        if choice == 'q':
+            print("❌ User aborted.")
+            sys.exit()
+        
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(valid_options):
+                new_ratio = valid_options[idx]
+                print(f"✅  Switched Aspect Ratio to: {new_ratio}")
+                return new_ratio
+        
+        print("   Invalid selection. Try again.")
 
 # =======================================================
-# 🧩 核心處理邏輯 (Process Item) - 雙引擎切換版
+# 🧩 核心處理邏輯 (Process Item)
 # =======================================================
-def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruction, col_map):
+def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings):
     """
-    雙引擎處理邏輯：
-    1. 若是 Imagen -> 走 generate_images (僅支援文生圖)
-    2. 若是 Gemini -> 走 generate_content (支援文生圖/圖生圖, 設定 response_modalities)
+    雙引擎處理邏輯 + 顯示存檔路徑
     """
     try:
         item_id = str(row[col_map['ID']] if col_map['ID'] in row else 'Unknown').strip()
@@ -149,17 +227,19 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
     except:
         return {"error": "Column read error"}
     
-    # 1. 處理長寬比
-    if ratio_row is not None and not ratio_row.empty:
-        ar_val = str(ratio_row.get('aspect_ratio', '1:1')).strip()
-        ratio_name = str(ratio_row.get('ratio_name', 'AR')).strip()
-    else:
-        ar_val = '1:1'
-        ratio_name = '1x1'
+    # 處理 Aspect Ratio 字串 (例如 09:16:00 -> 9:16)
+    ar_val = str(target_ratio if target_ratio else '1:1').strip()
+    
+    # 嘗試清理不標準的 AR (例如包含秒數的 09:16:00)
+    if ar_val.count(':') == 2:
+        ar_val = ar_val.rsplit(':', 1)[0] # 去掉最後一個 :00
+    if ar_val.startswith('0'):
+        ar_val = ar_val[1:] # 去掉開頭的 0 (如 09:16 -> 9:16)
+        
+    ratio_name = ar_val.replace(':', 'x')
     
     final_prompt_text = f"{instruction}\n\nAspect Ratio: {ar_val}\nPrompt: {prompt_text}"
 
-    # 2. 準備圖片 (如果有的話)
     image_bytes = None
     mime_type = "image/jpeg"
     
@@ -192,30 +272,28 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
             return {"status": "Mock Success", "path": "mock.png"}
 
         img_result_data = None
-
-        # 🔥【分流判斷】
         is_imagen = 'imagen' in model_name.lower()
         
         # ==========================================
-        # 🅰️ 路線 A: Imagen (專用 generate_images)
+        # 🅰️ 路線 A: Imagen (Generate Images)
         # ==========================================
         if is_imagen:
-            # Imagen 此腳本僅支援文生圖
             if image_bytes:
                 return {"error": "Imagen model does not support Ref Image in this script. Switch to Gemini."}
 
-            # 設定 Imagen 參數
-            gen_config = types.GenerateImagesConfig(
-                aspect_ratio=ar_val if ':' not in ar_val else None,
-                number_of_images=1
-            )
+            # 🔥 [修正] 移除 safety_settings (導致 Extra inputs not permitted 錯誤的原因)
+            config_params = {
+                'number_of_images': 1,
+                'aspect_ratio': ar_val,
+                'output_mime_type': "image/jpeg"
+            }
             
-            # 呼叫 Imagen API
             response = call_api_with_retry(
                 global_client.models.generate_images, 
                 model=model_name, 
                 prompt=final_prompt_text, 
-                config=gen_config
+                config=config_params,
+                retry_settings=retry_settings
             )
             
             if response.generated_images:
@@ -224,29 +302,25 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
                 return {"error": "Imagen returned no images"}
 
         # ==========================================
-        # 🅱️ 路線 B: Gemini (通用 generate_content)
+        # 🅱️ 路線 B: Gemini (Generate Content)
         # ==========================================
         else:
-            # 準備 Parts (文字 + 圖片)
             parts = [types.Part.from_text(text=final_prompt_text)]
-            
             if image_bytes:
                 parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
 
-            # 設定 Gemini 參數 (關鍵：response_modalities=["IMAGE"])
             gen_config = types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
             )
 
-            # 呼叫 Gemini API
             response = call_api_with_retry(
                 global_client.models.generate_content,
                 model=model_name,
                 contents=[types.Content(role="user", parts=parts)],
-                config=gen_config
+                config=gen_config,
+                retry_settings=retry_settings
             )
 
-            # 解析 Gemini 回傳 (inline_data)
             if response.candidates:
                 for candidate in response.candidates:
                     if candidate.content and candidate.content.parts:
@@ -261,7 +335,7 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
                 return {"error": f"Gemini Refused: {err}"}
 
         # ==========================================
-        # 🏁 存檔 (共通)
+        # 🏁 存檔
         # ==========================================
         if img_result_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -274,7 +348,7 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
             with open(save_path, "wb") as f:
                 f.write(img_result_data)
             
-            return {"status": "Success", "path": filename}
+            return {"status": "Success", "path": save_path}
         else:
             return {"error": "Unknown error: No data extracted"}
 
@@ -286,24 +360,27 @@ def process_single_item(row, ratio_row, sheet_name, model_name, use_ref, instruc
 # =======================================================
 def load_settings(config_path):
     """
-    讀取 Config_Data.xlsx 參數
-    🔥 第一道過濾：Model_Type 必須為 'Image'
+    讀取 Config_Data.xlsx
+    🔥 修正：完整讀取 Concurrency_Config 並打包成 retry_settings
     """
-    # 預設值，若 Config 全錯則使用此安全值
-    settings = { "model_name": "gemini-2.5-flash-image", "ratios": pd.DataFrame(), "max_workers": 1 }
+    settings = { 
+        "model_name": "gemini-2.5-flash-image", 
+        "aspect_ratio": "1:1", 
+        "max_workers": 1,
+        "retry_settings": {"max_retries": 3, "retry_backoff": 5}, # 預設值
+        "ratios_df": pd.DataFrame()
+    }
     
     if not os.path.exists(config_path): 
         log(f"⚠️ Config file not found at {config_path}. Using defaults.")
         return settings
 
     try:
-        # 1. Model Config (過濾 Model_Type)
+        # 1. Model Config
         try:
             df = pd.read_excel(config_path, sheet_name='Model_Config')
             df = normalize_cols(df)
             
-            # 篩選條件：(Selection=True) AND (Model_Type='Image')
-            # 允許 'Image' 大小寫不同，去除空格
             is_selected = df['selection'].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 'on'])
             is_image_type = df['model_type'].astype(str).str.strip().str.lower() == 'image'
             
@@ -314,67 +391,80 @@ def load_settings(config_path):
                 log(f"✅ Loaded Image Model from Config: {settings['model_name']}")
             else:
                 log("⚠️ No valid 'Image' model selected in Config. Using default.")
-                
         except Exception as e:
             log(f"⚠️ Error reading Model_Config: {e}")
 
-        # 2. Workers
+        # 2. Concurrency Config (🔥 完整讀取)
         try:
             df = pd.read_excel(config_path, sheet_name='Concurrency_Config')
             df = normalize_cols(df)
             d = dict(zip(df['parameter'].astype(str).str.upper(), df['value']))
-            if 'MAX_WORKERS' in d: settings["max_workers"] = int(float(d['MAX_WORKERS']))
-        except: pass
+            
+            # 讀取 Max Workers
+            if 'MAX_WORKERS' in d: 
+                settings["max_workers"] = int(float(d['MAX_WORKERS']))
+            
+            # 讀取 Retry 相關設定
+            retry_config = {}
+            if 'API_RETRY_ATTEMPTS' in d:
+                retry_config['max_retries'] = int(float(d['API_RETRY_ATTEMPTS']))
+            if 'RETRY_INITIAL_BACKOFF' in d:
+                retry_config['retry_backoff'] = int(float(d['RETRY_INITIAL_BACKOFF']))
+            
+            # 更新 settings
+            settings["retry_settings"].update(retry_config)
+            
+            log(f"✅ Loaded Concurrency: Workers={settings['max_workers']}, Retries={settings['retry_settings']['max_retries']}")
 
-        # 3. Ratios
+        except Exception as e:
+            log(f"⚠️ Error reading Concurrency_Config: {e}")
+
+        # 3. Aspect Ratio
         try:
             df = pd.read_excel(config_path, sheet_name='Aspect_Ratio')
             df = normalize_cols(df)
-            settings["ratios"] = df[df['selection'].astype(str).str.lower().isin(['true', '1', 'yes', 'y'])]
-        except: pass
+            settings["ratios_df"] = df
+
+            is_selected = df['selection'].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 'on'])
+            sel_ar = df[is_selected]
+            
+            if not sel_ar.empty:
+                raw_ar = str(sel_ar.iloc[0].get('aspect_ratio', '1:1')).strip()
+                settings["aspect_ratio"] = raw_ar
+                log(f"✅ Loaded Aspect Ratio from Config: {settings['aspect_ratio']}")
+            else:
+                log("⚠️ No Aspect Ratio selected in Config. Defaulting to 1:1.")
+                
+        except Exception as e:
+            log(f"⚠️ Error reading Aspect_Ratio: {e}")
 
     except Exception as e: 
         log(f"⚠️ Error reading config: {e}")
     return settings
 
 def configure_runtime_settings(initial_model_name):
-    """
-    詢問用戶設定
-    🔥 第二道過濾：若 Ref Image=ON，強制切換至 2.5/3.0 Image
-    """
     print("\n" + "="*30 + "\n   🛠️  RUNTIME SETTINGS\n" + "="*30)
     
-    # 1. Test Mode
     t_in = input("👉 Run single test mode? (Y/N) [default: Y]: ").strip().upper()
     test_single = False if t_in == 'N' else True
     
-    # 2. Ref Image
     r_in = input("👉 Do you want to upload a reference image? (Y/N) [default: N]: ").strip().upper()
     use_ref = True if r_in == 'Y' else False
 
-    # 3. Model Logic (強制切換檢查)
     final_model = initial_model_name
     
     if use_ref:
-        # 🛑 規則：上傳圖片模式 (Image-to-Image) 必須是 Gemini Image 模型
-        # 檢查邏輯：名稱必須包含 'gemini' 且包含 'image'
-        # 排除 imagen，也排除 gemini 純文字版
-        
         name_lower = final_model.lower()
         is_valid_img2img = ('gemini' in name_lower) and ('image' in name_lower)
-        
         if not is_valid_img2img:
             print(f"⚠️  Model '{final_model}' does not support Image-to-Image.")
             final_model = 'gemini-2.5-flash-image'
             print(f"🔄  Forced switch to: {final_model}")
         else:
             print(f"✅  Reference Image Mode ON. Using: {final_model}")
-            
     else:
-        # 沒上傳圖片，尊重 Config (此時可能是 Imagen 或 Gemini 文生圖)
         print(f"✅  Model selected: {final_model}")
 
-    # 允許手動最後修改
     print("-" * 30)
     print(f"Current Model: [{final_model}]")
     change_model = input("👉 Do you want to change the model? (Enter new name or Press Enter to skip): ").strip()
@@ -390,7 +480,6 @@ def configure_runtime_settings(initial_model_name):
     return test_single, use_ref, final_model
 
 def find_actual_col_name(df_cols, key_alias):
-    """在 DataFrame 的 columns 中尋找符合別名的欄位"""
     aliases = COL_ALIASES.get(key_alias, [key_alias.lower()])
     for alias in aliases:
         if alias in df_cols:
@@ -404,12 +493,10 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
     
     try:
-        # 0. 初始化檢查
         initialize_image_system()
         default_instruction = "Generate a high-quality image based on the prompt."
         ensure_template_exists(INSTRUCTION_FILE, default_instruction)
 
-        # 1. API Init
         log("\n--- API Setup ---")
         env_config = dotenv_values(ENV_FILE_PATH)
         GEMINI_API_KEY = env_config.get("GEMINI_API_KEY")
@@ -428,15 +515,14 @@ if __name__ == '__main__':
 
         instruction_content = load_template(INSTRUCTION_FILE)
 
-        # 2. Load Settings (第一道過濾：Model_Type=Image)
         CONFIG_PATH = os.path.join(BASE_DIR, "Config_Data.xlsx")
         log(f"⏳ Loading base settings from: {os.path.basename(CONFIG_PATH)}...")
         settings = load_settings(CONFIG_PATH)
         
-        # 3. Runtime Inputs (第二道過濾：Ref Image 強制切換)
         test_single, use_ref_image, target_model = configure_runtime_settings(settings["model_name"])
 
-        # 4. Folder Input & Scan
+        validated_ratio = validate_aspect_ratio_support(target_model, settings["aspect_ratio"], settings["ratios_df"])
+
         default_folder = "Generated_Content"
         f_in = input(f"👉 Enter input folder name (default: '{default_folder}'): ").strip()
         target_folder_name = f_in if f_in else default_folder
@@ -446,20 +532,18 @@ if __name__ == '__main__':
             print(f"❌ Folder '{target_folder_name}' not found. Scanning root directory instead...")
             target_folder_path = BASE_DIR
         
-        # 掃描資料夾內的 Excel
         all_files = [f for f in os.listdir(target_folder_path) if f.lower().endswith(('.xlsx', '.xls')) and not f.startswith('~$')]
-        # 排除 Config_Data 本身，避免將設定檔當作資料檔處理
         all_files = [f for f in all_files if "config_data" not in f.lower()]
 
         if not all_files:
-            log("❌ No valid Excel files found for processing. Exiting.")
+            log("❌ No valid Excel files found. Exiting.")
             sys.exit()
 
-        print(f"📂 Found {len(all_files)} Excel file(s) in '{os.path.basename(target_folder_path)}'.")
-        print(f"🚀 Initializing Generator with model: [{target_model}]...")
+        print(f"📂 Found {len(all_files)} Excel file(s).")
+        print(f"🚀 Initializing Generator with model: [{target_model}]")
+        print(f"📐 Target Aspect Ratio: [{validated_ratio}]")
         time.sleep(1)
 
-        # 5. Execution Loop (File -> Sheet -> Row)
         for file_name in all_files:
             file_path = os.path.join(target_folder_path, file_name)
             log(f"\n📦 Processing File: {file_name}")
@@ -480,15 +564,11 @@ if __name__ == '__main__':
                     df = normalize_cols(df)
                 except: continue
 
-                # 檢查必要欄位
                 id_col = find_actual_col_name(df.columns, 'ID')
                 prompt_col = find_actual_col_name(df.columns, 'Prompt')
-                
-                if not id_col or not prompt_col:
-                    continue 
+                if not id_col or not prompt_col: continue 
 
                 col_map = {'ID': id_col, 'Prompt': prompt_col}
-
                 if use_ref_image:
                     img_col = find_actual_col_name(df.columns, 'Image_name')
                     if not img_col:
@@ -498,27 +578,21 @@ if __name__ == '__main__':
 
                 log(f"  📂 Sheet: {sheet}")
 
-                # Build Jobs
                 jobs = []
                 for _, row in df.iterrows():
-                    # 基本防呆
                     if not str(row[id_col]).strip() or not str(row[prompt_col]).strip(): continue
                     
-                    if not settings["ratios"].empty:
-                        for _, r_row in settings["ratios"].iterrows():
-                            jobs.append((row, r_row, sheet, target_model, use_ref_image, instruction_content, col_map))
-                            if test_single: break
-                    else:
-                        jobs.append((row, None, sheet, target_model, use_ref_image, instruction_content, col_map))
-                    
+                    # 🔥 傳入 retry_settings
+                    jobs.append((row, validated_ratio, sheet, target_model, use_ref_image, instruction_content, col_map, settings["retry_settings"]))
                     if test_single: break
                 
                 if not jobs:
                     log("     ℹ️  No valid jobs.")
                     continue
 
-                # Run Threads
-                log(f"     🔥 Starting {len(jobs)} tasks...")
+                log(f"     🔥 Starting {len(jobs)} tasks (Max Workers: {settings['max_workers']})...")
+                
+                # 🔥 使用 Config 讀取的 Max Workers
                 with ThreadPoolExecutor(max_workers=settings["max_workers"]) as executor:
                     futures = {executor.submit(process_single_item, *j): j for j in jobs}
                     for i, f in enumerate(as_completed(futures)):
@@ -526,9 +600,8 @@ if __name__ == '__main__':
                         if "error" in res:
                             print(f"\n     ❌ Error: {res['error']}")
                         else:
-                            print(".", end="", flush=True)
+                            print(f"\n     ✅ Saved: {res['path']}")
 
-                print("") 
                 if test_single: 
                     print("  🛑 Test mode: Stopping after first active sheet.")
                     break
