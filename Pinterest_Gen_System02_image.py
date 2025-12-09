@@ -1,6 +1,12 @@
+print("🚀 System initializing... Please wait while libraries are loading.")
+
+import sys
 import os
 import time
 import base64
+import random
+import logging
+import shutil  # ✅ 用於複製檔案
 from io import BytesIO
 from PIL import Image
 import pandas as pd
@@ -8,263 +14,327 @@ from google import genai
 from google.genai import types
 from dotenv import dotenv_values
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed # 引入並行處理模組
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 設定並行處理的最大執行緒數
-MAX_WORKERS = 3
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, total=None, desc="", unit="", ncols=0):
+        return iterable
+
+MAX_WORKERS = 5
 
 # ------------------- Path setup -------------------
-script_dir = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    # EXE 模式：
+    # script_dir = EXE 所在的外部資料夾 (我們要把檔案釋放到這裡)
+    script_dir = os.path.dirname(sys.executable)
+    # internal_resource_dir = EXE 內部的暫存資料夾 (預設檔案藏在這裡)
+    internal_resource_dir = sys._MEIPASS 
+else:
+    # 開發模式：
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    internal_resource_dir = script_dir
+
 ENV_FILE_PATH = os.path.join(script_dir, ".env")
-
 GENERATED_CONTENT_FOLDER = os.path.join(script_dir, "Generated_Content")
-PRODUCT_IMAGE_FOLDER = os.path.join(script_dir, "product_image")
-
+REF_IMAGE_FOLDER = os.path.join(script_dir, "ref_image")
 INSTRUCTION_FILE = os.path.join(script_dir, "image_generation_instruction.txt")
+LOG_DIR = os.path.join(script_dir, "Logs")
 
-# ------------------- Default instruction template -------------------
+# ------------------- Self-Healing: Restore Missing Files -------------------
+def restore_default_files():
+    """
+    從 EXE 內部釋放必要檔案到外部。
+    關鍵邏輯：只在「外部檔案不存在」時才複製，確保不覆蓋舊資料。
+    """
+    required_files = [
+        "Pinterest_Affiliate_Data.xlsx",
+        "Pinterest_Affiliate_Product.xlsx",
+        "image_generation_instruction.txt",
+        ".env"
+    ]
+
+    print("\n🔍 Checking system integrity...")
+    
+    for filename in required_files:
+        target_path = os.path.join(script_dir, filename)
+        
+        # ⚠️ 這裡是最重要的保護機制：
+        # 只有當檔案「不存在」時，才從內部複製出來。
+        if not os.path.exists(target_path):
+            source_path = os.path.join(internal_resource_dir, filename)
+            
+            if os.path.exists(source_path):
+                try:
+                    shutil.copy2(source_path, target_path)
+                    print(f"   ✨ Initialized missing file: {filename}")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to restore {filename}: {e}")
+            else:
+                # 這種情況通常不會發生，除非打包時漏了
+                print(f"   ❌ Critical: Internal resource missing for {filename}")
+        else:
+            # 檔案已存在，表示可能是舊用戶的資料，直接跳過，不做任何動作
+            # print(f"   ✓ Found existing: {filename} (Skipping overwrite)")
+            pass
+
+# ------------------- Logging Setup -------------------
+def setup_logging():
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"Image_Gen_Log_{timestamp}.txt"
+    log_filepath = os.path.join(LOG_DIR, log_filename)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filepath, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return log_filepath
+
+# ------------------- Instruction Loader -------------------
 default_instruction = """
 Use the provided product image as the main object in the composition.
 Ensure the final image is Pinterest-ready: visually appealing, clean, and photorealistic.
-
-Instructions:
-- Keep the product clear and proportional to the original reference image.
-- Remove any text, watermarks, or annotations.
-- Create a realistic scene that complements the product style.
-- Maintain ultra-high quality, cinematic lighting, and realistic texture.
-- The final image should have a Pinterest aspect ratio and no measurement lines or labels.
 """
 
-def ensure_template_exists(path, default_text):
-    """Create a default text file if missing."""
-    if not os.path.isfile(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(default_text.strip())
-        print(f"🆕 Created default instruction file: {os.path.basename(path)}")
-
 def load_instruction_text():
-    ensure_template_exists(INSTRUCTION_FILE, default_instruction)
-    with open(INSTRUCTION_FILE, "r", encoding="utf-8") as f:
-        return f.read().strip()
+    # 因為 restore_default_files 會確保檔案存在，所以這裡優先讀檔
+    if os.path.isfile(INSTRUCTION_FILE):
+        with open(INSTRUCTION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return default_instruction
 
 # ------------------- API Call Worker Function -------------------
-
 def generate_and_save_image(client, row_data, instruction_text, ASPECT_RATIO, MODEL_NAME, output_dir):
-    """
-    單一工作單元：負責圖片生成和儲存。
-    回傳一個字典，包含處理結果或錯誤信息。
-    """
-    pin_name = str(row_data["Pin_Name_For_Upload"]).strip()
-    image_prompt = str(row_data["Image_Prompt_For_AI"]).strip()
-    image_name = str(row_data["Image_name"]).strip()
-    product_id = str(row_data["Product_ID"]).strip()
+    pin_name = str(row_data.get("Pin_Name_For_Upload", "")).strip()
+    image_prompt = str(row_data.get("Image_Prompt_For_AI", "")).strip()
+    image_name = str(row_data.get("Image_name", "")).strip()
+    product_id = str(row_data.get("Product_ID", "")).strip()
     
-    # 建立回傳數據的基礎結構
     result = {"row_data": row_data.to_dict(), "Generation_Error": None, "Success": False}
     
-    # --- 1. 檢查 Image Prompt ---
-    if not image_prompt or image_prompt.lower() == 'nan' or image_prompt.lower().startswith('error'):
-        result["Generation_Error"] = "❌ Missing or invalid Image Prompt ('Image_Prompt_For_AI' is empty or error code)."
+    if not image_prompt or image_prompt.lower() == 'nan':
+        result["Generation_Error"] = "❌ Missing Image Prompt."
         return result
 
-    # --- 2. 檢查原始產品圖片 ---
-    image_path = os.path.join(PRODUCT_IMAGE_FOLDER, image_name)
+    image_path = os.path.join(REF_IMAGE_FOLDER, image_name)
     if not os.path.isfile(image_path):
-        result["Generation_Error"] = f"❌ Missing product image file: {image_name}"
+        result["Generation_Error"] = f"❌ Missing file: {image_name}"
         return result
 
     try:
-        product_image = Image.open(image_path)
+        ref_image = Image.open(image_path)
     except Exception as e:
-        result["Generation_Error"] = f"❌ Failed to open/load product image {image_name}. Error: {e}"
+        result["Generation_Error"] = f"❌ Failed to open image: {e}"
         return result
 
-    # --- 3. API 呼叫設定 ---
     final_prompt = f"{image_prompt}\n\n{instruction_text}"
-    contents = [final_prompt, product_image]
+    contents = [final_prompt, ref_image]
 
     generate_config = types.GenerateContentConfig(
         response_modalities=["IMAGE", "TEXT"],
         image_config=types.ImageConfig(aspect_ratio=ASPECT_RATIO)
     )
 
-    try:
-        print(f"🧠 Generating image for: {pin_name} (Product_ID: {product_id}) ...")
-        resp = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=generate_config
-        )
-    except Exception as e:
-        result["Generation_Error"] = f"API error during generation: {e}"
-        return result
-
-    # --- 4. 儲存生成的圖片 ---
-    image_saved = False
-    if resp.candidates and resp.candidates[0].content.parts:
-        for part in resp.candidates[0].content.parts:
-            if part.inline_data:
-                mime_type = getattr(part.inline_data, "mime_type", "")
-                if mime_type.startswith("image/"):
-                    try:
-                        img_bytes = base64.b64decode(part.inline_data.data)
-                        img = Image.open(BytesIO(img_bytes))
-                        safe_name = "".join(c if c.isalnum() else "_" for c in pin_name)
-                        filename = f"{safe_name}.png"
-                        save_path = os.path.join(output_dir, filename)
-                        img.save(save_path)
-                        image_saved = True
-                        print(f"✅ Image saved: {save_path}")
-                    except Exception as e:
-                        result["Generation_Error"] = f"⚠️ Failed to save image to disk (Product_ID: {product_id}): {e}"
-                        return result
-                    
-    if not image_saved:
-        result["Generation_Error"] = "Invalid, empty, or failed to save generated image (API returned no valid data)."
-        return result
+    max_retries = 5
+    retry_delay = 2
+    generated_resp = None
     
-    result["Success"] = True
+    for attempt in range(max_retries):
+        try:
+            generated_resp = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=generate_config
+            )
+            break
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "resource exhausted" in error_str or "503" in error_str:
+                if attempt < max_retries - 1:
+                    sleep_time = retry_delay + random.uniform(0, 1)
+                    logging.debug(f"Rate limit hit for {product_id}, retrying in {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                    retry_delay *= 2
+                else:
+                    result["Generation_Error"] = f"❌ Max retries reached: {e}"
+                    return result
+            else:
+                result["Generation_Error"] = f"❌ API Error: {e}"
+                return result
+
+    if generated_resp and generated_resp.candidates and generated_resp.candidates[0].content.parts:
+        for part in generated_resp.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                try:
+                    img_bytes = part.inline_data.data
+                    img = Image.open(BytesIO(img_bytes))
+                    
+                    safe_pin_name = "".join(c if c.isalnum() else "_" for c in pin_name)[:50]
+                    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+                    filename = f"{safe_pin_name}_{timestamp}.png"
+                    
+                    save_path = os.path.join(output_dir, filename)
+                    img.save(save_path)
+                    
+                    result["Success"] = True
+                    return result
+                except Exception as e:
+                    result["Generation_Error"] = f"⚠️ Save failed: {e}"
+                    return result
+    
+    if not result["Success"] and not result["Generation_Error"]:
+        result["Generation_Error"] = "API returned no image data."
+
     return result
 
 # ------------------- Main Execution -------------------
 
-# ------------------- User input settings -------------------
-print("\n=== Pinterest Image Generator Configuration ===")
-TEST_SINGLE = input("Run in single test mode? (Y/N): ").strip().lower() == 'y'
-ASPECT_RATIO = input("Enter desired image aspect ratio (default 2:3): ").strip() or "2:3"
-MODEL_NAME = input("Enter Gemini model name (default gemini-2.5-flash-image): ").strip() or "gemini-2.5-flash-image"
+if __name__ == "__main__":
+    # 1.【第一步】執行自我修復
+    # 如果是新用戶，這一步會釋放出 .env 和 Excel
+    # 如果是老用戶，這一步什麼都不會做，確保資料安全
+    restore_default_files()
 
-# ------------------- Load API key -------------------
-print("\n--- Loading configuration and API key ---")
-# Get GEMINI_API_KEY from .env 
-env_config = dotenv_values(ENV_FILE_PATH)
-GEMINI_API_KEY = env_config.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("🛑 Missing GEMINI_API_KEY in .env file.")
-    exit()
-client = genai.Client(api_key=GEMINI_API_KEY)
+    # 2. 檢查工作目錄 (沒有才建立，避免 Crash)
+    if not os.path.exists(GENERATED_CONTENT_FOLDER):
+        os.makedirs(GENERATED_CONTENT_FOLDER, exist_ok=True)
+        print(f"📁 Initialized folder: Generated_Content")
 
-# ------------------- Load instruction text -------------------
-instruction_text = load_instruction_text()
+    if not os.path.exists(REF_IMAGE_FOLDER):
+        os.makedirs(REF_IMAGE_FOLDER, exist_ok=True)
+        print(f"📁 Initialized folder: ref_image")
 
-# ------------------- Locate Excel files -------------------
-excel_files = [f for f in os.listdir(GENERATED_CONTENT_FOLDER) if f.lower().endswith(".xlsx")]
-if not excel_files:
-    print(f"🛑 No Excel files found in {GENERATED_CONTENT_FOLDER}")
-    exit()
-
-all_tasks = []
-all_results = []
-missing_images = []
-generation_error_list = []
-
-# ------------------- Prepare all tasks -------------------
-print("\n--- Preparing all image generation tasks ---")
-for excel_file in excel_files:
-    excel_path = os.path.join(GENERATED_CONTENT_FOLDER, excel_file)
-    output_dir = os.path.join(GENERATED_CONTENT_FOLDER, os.path.splitext(excel_file)[0])
-    os.makedirs(output_dir, exist_ok=True)
-
-    xls = pd.ExcelFile(excel_path)
-    for sheet_name in xls.sheet_names:
-        df = pd.read_excel(excel_path, sheet_name=sheet_name)
-        df.columns = df.columns.str.strip()
-
-        required_cols = ["Pin_Name_For_Upload", "Image_Prompt_For_AI", "Image_name", "Product_ID"]
-        if not all(col in df.columns for col in required_cols):
-            print(f"⚠️ Sheet {sheet_name} in {excel_file} missing required columns {required_cols}, skipping.")
-            continue
-        
-        for idx, row in df.iterrows():
-            # 將每個 row 及其必要的上下文作為一個任務加入列表
-            task = {
-                "row_data": row,
-                "output_dir": output_dir
-            }
-            all_tasks.append(task)
-            
-            if TEST_SINGLE:
-                break
-        if TEST_SINGLE:
-            break
-    if TEST_SINGLE:
-        break
-
-print(f"📝 Total tasks prepared: {len(all_tasks)}")
-
-# ------------------- Execute tasks concurrently -------------------
-print(f"\n🚀 Starting concurrent image generation with {MAX_WORKERS} workers...")
-start_time = time.time()
-
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    # 提交所有任務到執行緒池
-    futures = [
-        executor.submit(
-            generate_and_save_image, 
-            client, 
-            task["row_data"], 
-            instruction_text, 
-            ASPECT_RATIO, 
-            MODEL_NAME, 
-            task["output_dir"]
-        ) 
-        for task in all_tasks
-    ]
-
-    # 處理已完成的任務
-    for future in as_completed(futures):
-        try:
-            result = future.result()
-            all_results.append(result)
-            
-            if not result["Success"]:
-                error_message = result["Generation_Error"]
-                error_data = result["row_data"]
-                error_data["Generation_Error"] = error_message
-                generation_error_list.append(error_data)
-                
-                # 特殊處理圖片缺失錯誤
-                if "Missing product image file" in error_message or "Failed to open/load product image" in error_message:
-                    missing_images.append(error_data["Product_ID"])
-
-        except Exception as e:
-            # 捕獲執行緒層面的意外錯誤
-            print(f"❌ An unexpected error occurred in a worker thread: {e}")
-
-
-end_time = time.time()
-print(f"\n⏱️ Concurrent processing finished in {end_time - start_time:.2f} seconds.")
-
-# ------------------- Summary -------------------
-if missing_images:
-    # 使用 set 避免重複的 Product_ID
-    unique_missing = sorted(list(set(missing_images)))
-    print("\n⚠️ Missing images for the following Product_IDs (See report for details):")
-    for pid in unique_missing:
-        print(f" - {pid}")
-else:
-    print("\n✅ All product image files were located.")
-
-# ------------------- Write Error Output -------------------
-if generation_error_list:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path_errors = os.path.join(script_dir, f"Image_Gen_Errors_{timestamp}.xlsx")
+    # 3. 初始化 Log
+    log_file_path = setup_logging()
     
-    try:
-        # 使用收集到的錯誤列表建立 DataFrame
-        df_gen_errors = pd.DataFrame(generation_error_list)
-        df_gen_errors['Error_Time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 寫入 Excel
-        with pd.ExcelWriter(output_path_errors, engine='openpyxl') as writer:
-            df_gen_errors.to_excel(writer, sheet_name='Image_Generation_Failures', index=False)
-            
-        print(f"\n🚨 {len(df_gen_errors)} image generation errors found (API or I/O failure).")
-        print(f"💾 Detailed error report saved to: {output_path_errors}")
-    except Exception as e:
-        print(f"❌ CRITICAL: Failed to write image error report: {e}")
-else:
-    print("\n✅ No image generation errors reported.")
-# ----------------------------------------------------------------------
+    print("\n=== Pinterest Image Generator ===")
+    logging.info("=== Program Started ===")
+    
+    # 讀取 .env (restore_default_files 確保了它一定存在)
+    env_config = dotenv_values(ENV_FILE_PATH)
+    GEMINI_API_KEY = env_config.get("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        msg = "🛑 Missing GEMINI_API_KEY in .env file."
+        print(msg)
+        logging.error(msg)
+        input("Press Enter to exit...")
+        exit()
+    
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-print("\n--- All tasks completed ---")
+    # User Inputs
+    TEST_SINGLE = input("Run single test? (Y/N): ").strip().lower() == 'y'
+    ASPECT_RATIO = input("Aspect ratio (default 2:3): ").strip() or "2:3"
+    MODEL_NAME = input("Model name (default gemini-2.5-flash-image): ").strip() or "gemini-2.5-flash-image"
+    
+    logging.info(f"Configuration: Single Test={TEST_SINGLE}, Ratio={ASPECT_RATIO}, Model={MODEL_NAME}")
+    
+    instruction_text = load_instruction_text()
+    
+    # 讀取 Excel
+    excel_files = [f for f in os.listdir(GENERATED_CONTENT_FOLDER) if f.lower().endswith(".xlsx")]
+    if not excel_files:
+        msg = f"🛑 No Excel files found in '{GENERATED_CONTENT_FOLDER}' folder."
+        print(msg)
+        print("💡 Please make sure you have generated content using the Content Generator.")
+        logging.warning(msg)
+        input("\nPress Enter to exit...")
+        exit()
+
+    all_tasks = []
+    
+    print("\n--- Reading Excel files ---")
+    for excel_file in excel_files:
+        excel_path = os.path.join(GENERATED_CONTENT_FOLDER, excel_file)
+        output_dir = os.path.join(GENERATED_CONTENT_FOLDER, os.path.splitext(excel_file)[0])
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            xls = pd.ExcelFile(excel_path)
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(excel_path, sheet_name=sheet_name)
+                df.columns = df.columns.str.strip()
+                
+                required = ["Pin_Name_For_Upload", "Image_Prompt_For_AI", "Image_name", "Product_ID"]
+                if not all(col in df.columns for col in required):
+                    logging.warning(f"Skipping sheet {sheet_name} in {excel_file}: Missing columns.")
+                    continue
+                
+                for _, row in df.iterrows():
+                    all_tasks.append({"row_data": row, "output_dir": output_dir})
+                    if TEST_SINGLE: break
+                if TEST_SINGLE: break
+        except Exception as e:
+            logging.error(f"Error reading {excel_file}: {e}")
+            print(f"⚠️ Error reading {excel_file}: {e}")
+            
+        if TEST_SINGLE and all_tasks: break
+
+    total_tasks = len(all_tasks)
+    msg_start = f"📝 Total tasks: {total_tasks}. Output Directory: {GENERATED_CONTENT_FOLDER}"
+    print(msg_start)
+    logging.info(msg_start)
+    
+    print(f"\n🚀 Starting processing ({MAX_WORKERS} workers)...")
+    start_time = time.time()
+    
+    results_summary = []
+    generation_error_list = []
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(
+                generate_and_save_image, 
+                client, 
+                t["row_data"], 
+                instruction_text, 
+                ASPECT_RATIO, 
+                MODEL_NAME, 
+                t["output_dir"]
+            ) 
+            for t in all_tasks
+        ]
+
+        for future in tqdm(as_completed(futures), total=total_tasks, unit="img", ncols=100, desc="Generating"):
+            res = future.result()
+            results_summary.append(res)
+            if not res["Success"]:
+                res["row_data"]["Generation_Error"] = res["Generation_Error"]
+                generation_error_list.append(res["row_data"])
+                logging.error(f"Failed: {res['row_data'].get('Product_ID')} - {res['Generation_Error']}")
+
+    end_time = time.time()
+    duration = end_time - start_time
+    
+    success_count = sum(1 for r in results_summary if r["Success"])
+    fail_count = len(results_summary) - success_count
+    
+    print(f"\n" + "="*50)
+    print(f"⏱️  Finished in {duration:.2f}s (Avg: {duration/total_tasks if total_tasks else 0:.2f}s/img)")
+    print(f"✅ Success: {success_count}")
+    print(f"❌ Failed:  {fail_count}")
+    print("="*50)
+    
+    logging.info(f"Finished. Success: {success_count}, Failed: {fail_count}, Duration: {duration:.2f}s")
+
+    if generation_error_list:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        err_file = os.path.join(script_dir, f"Image_Gen_Errors_{timestamp}.xlsx")
+        pd.DataFrame(generation_error_list).to_excel(err_file, index=False)
+        print(f"💾 Error report saved: {err_file}")
+        logging.info(f"Error report saved to: {err_file}")
+
+    print("\n" + "="*50)
+    print(f"📂 Images saved to folder: {GENERATED_CONTENT_FOLDER}")
+    print(f"📄 Detailed Log saved to:  {log_file_path}")
+    print("="*50)
+    
+    input("\n✅ Work completed. Press Enter to exit program...")

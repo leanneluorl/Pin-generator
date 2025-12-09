@@ -16,15 +16,61 @@ from google import genai
 from google.genai.errors import APIError
 from jinja2 import Template
 import multiprocessing
+import shutil  # ⚠️ 記得確保有這行 import
 
 # 忽略 pandas 的 FutureWarning
 warnings.filterwarnings("ignore")
 
+
+# =======================================================
+# 🛠️ 自動釋放資源函式 (Self-Extracting Logic)
+# =======================================================
+def check_and_release_assets(base_dir):
+    """
+    EXE 啟動時檢查：
+    如果外部沒有設定檔，就從 EXE 內部 (sys._MEIPASS) 複製一份出來。
+    """
+    # 這是 PyInstaller 打包後的內部暫存路徑
+    if hasattr(sys, '_MEIPASS'):
+        internal_path = sys._MEIPASS
+    else:
+        # 如果是跑原始碼 .py，來源就是當前目錄
+        internal_path = base_dir
+
+    # 定義要檢查並釋放的檔案 (檔名必須與 build.py 打包時的目標名稱一致)
+    files_to_check = [
+        "Config_Data.xlsx", 
+        "Pinterest_Affiliate_Product.xlsx",
+        "image_prompt_template.txt", 
+        "content_prompt_template.txt",
+        ".env" # 如果有需要的話
+    ]
+
+    print("\n🔍 System Integrity Check (Auto-Release)...")
+    
+    for filename in files_to_check:
+        target_file = os.path.join(base_dir, filename)
+        source_file = os.path.join(internal_path, filename)
+
+        # 1. 檢查外部檔案是否存在
+        if not os.path.exists(target_file):
+            # 2. 外部沒有，嘗試從內部複製
+            if os.path.exists(source_file):
+                try:
+                    shutil.copy2(source_file, target_file)
+                    print(f"   🆕 Missing file created: {filename}")
+                except Exception as e:
+                    print(f"   ❌ Failed to create {filename}: {e}")
+            else:
+                # 內部也沒有 (可能是開發環境沒放 sample)
+                print(f"   ⚠️ Internal source missing: {filename}")
+        else:
+            # 外部已有檔案，不做事 (避免覆蓋使用者的設定)
+            pass
 # =======================================================
 # 📂 核心路徑與 Log 設定
 # =======================================================
 def get_base_path():
-    """判斷 EXE 或 Python 環境，回傳根目錄"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     else:
@@ -61,31 +107,74 @@ print("-" * 50)
 
 # 設定其他檔案路徑
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
-CONFIG_FILE = os.path.join(BASE_DIR, "Pinterest_Affiliate_Data.xlsx")
 PRODUCT_FILE = os.path.join(BASE_DIR, "Pinterest_Affiliate_Product.xlsx")
 OUTPUT_FOLDER = os.path.join(BASE_DIR, "Generated_Content")
-PRODUCT_IMAGE_FOLDER = os.path.join(BASE_DIR, "product_image")
+REF_IMAGE_FOLDER = os.path.join(BASE_DIR, "ref_image")
 
 IMAGE_PROMPT_TEMPLATE_FILE = os.path.join(BASE_DIR, "image_prompt_template.txt")
 CONTENT_PROMPT_TEMPLATE_FILE = os.path.join(BASE_DIR, "content_prompt_template.txt")
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# 檢查必要檔案
-missing_files = []
-for path in [CONFIG_FILE, PRODUCT_FILE]:
-    if not os.path.isfile(path):
-        missing_files.append(os.path.basename(path))
+# =======================================================
+# 📂 Config 檔案選取邏輯
+# =======================================================
+CONFIG_FILE = None
 
-if missing_files:
-    log(f"\n❌ Critical Error: Missing required files in {BASE_DIR}:")
-    for f in missing_files:
-        log(f"   - {f}")
+while CONFIG_FILE is None:
+    log("\n🔍 Scanning for Config files...")
+    config_candidates = [f for f in os.listdir(BASE_DIR) if f.lower().startswith("config_data") and f.lower().endswith(".xlsx")]
+    options = config_candidates.copy()
+    manual_option_idx = len(options) + 1
+
+    print("\n" + "="*30)
+    print("   SELECT CONFIGURATION FILE")
+    print("="*30)
+
+    if not options:
+        log("⚠️ No auto-detected 'Config_Data*.xlsx' files found.")
+    else:
+        for idx, f in enumerate(options):
+            print(f"  [{idx + 1}] {f}")
+    
+    print(f"  [{manual_option_idx}] 📝 Enter file path manually")
+    print("-" * 30)
+
+    user_input = input(f"👉 Select an option (1-{manual_option_idx}): ").strip()
+    selected_temp_path = ""
+
+    if user_input.isdigit():
+        idx = int(user_input)
+        if 1 <= idx <= len(options):
+            selected_temp_path = os.path.join(BASE_DIR, options[idx-1])
+        elif idx == manual_option_idx:
+            manual_input = input("👉 Please enter the file name (e.g., MyConfig.xlsx): ").strip()
+            manual_input = manual_input.replace('"', '').replace("'", "")
+            if os.path.isabs(manual_input):
+                selected_temp_path = manual_input
+            else:
+                selected_temp_path = os.path.join(BASE_DIR, manual_input)
+        else:
+            log("❌ Invalid number. Please try again.")
+            continue
+    else:
+        log("❌ Please enter a valid number.")
+        continue
+
+    if os.path.isfile(selected_temp_path):
+        CONFIG_FILE = selected_temp_path
+        log(f"✅ Successfully loaded: {CONFIG_FILE}")
+    else:
+        log(f"❌ File not found: {selected_temp_path}")
+        print("   Please check the file name and try again.\n")
+
+if not os.path.isfile(PRODUCT_FILE):
+    log(f"\n❌ Critical Error: Missing product file: {PRODUCT_FILE}")
     input("Press Enter to exit...")
     sys.exit(1)
 
-if not os.path.isdir(PRODUCT_IMAGE_FOLDER):
-    log(f"⚠️ Image folder not found: {PRODUCT_IMAGE_FOLDER}. Products without images will be skipped.")
+if not os.path.isdir(REF_IMAGE_FOLDER):
+    log(f"⚠️ Image folder not found: {REF_IMAGE_FOLDER}. Products without images will be skipped.")
 
 # ------------------- Interactive settings -------------------
 log("\n--- Configuration Setup ---")
@@ -97,7 +186,6 @@ require_affiliate_link = require_affiliate_input == 'y'
 
 BASE_REQUIRED_COLS = ['Product_ID', 'Product_Name', 'Image_name', 'Product_desc']
 REQUIRED_PRODUCT_COLS = BASE_REQUIRED_COLS.copy()
-
 if require_affiliate_link:
     REQUIRED_PRODUCT_COLS.append('Affiliate_Link')
 
@@ -117,7 +205,6 @@ if not GEMINI_API_KEY:
 else:
     if not use_mock:
         try:
-            # 🔥 保持全域 Client 優化，避免重複連線
             global_client = genai.Client(api_key=GEMINI_API_KEY)
             log("✓ Global Gemini Client initialized.")
         except Exception as e:
@@ -152,7 +239,6 @@ def render_template(template_str):
     return Template(template_str).render()
 
 def resize_image_for_api(image_path, max_length=1024):
-    """讀取並縮小圖片以加快上傳與處理"""
     try:
         img = Image.open(image_path)
         if max(img.size) > max_length:
@@ -163,60 +249,84 @@ def resize_image_for_api(image_path, max_length=1024):
     except Exception as e:
         raise Exception(f"Failed to resize image: {e}")
 
-# 🔥 設定讀取邏輯
+def normalize_cols(df):
+    df.columns = df.columns.str.strip().str.lower()
+    return df
+
 def load_config_and_styles(config_file):
     try:
+        # 1. 讀取 Model Config
         df_model = pd.read_excel(config_file, sheet_name='Model_Config')
-        df_model.columns = df_model.columns.str.strip() 
+        df_model = normalize_cols(df_model) # 轉小寫: model_name, selection, model_type...
 
         def is_selected(val):
             s = str(val).strip().lower()
             return s in ['true', '1', 'yes', '1.0', 'y', 'on']
 
-        selected_model_series = df_model[df_model['Selection'].apply(is_selected)]
+        # 找出被勾選的模型
+        selected_model_series = df_model[df_model['selection'].apply(is_selected)]
         
-        selected_model = "gemini-2.0-flash" # 預設使用 2.0-flash
-        max_workers = 1 
-        delay_seconds = 0.0
-
+        # 設定預設安全模型
+        default_model = "gemini-2.0-flash"
+        selected_model = default_model
+        
         if selected_model_series.empty:
-            log(f"⚠️ No model selected. Defaulting to '{selected_model}', Workers: {max_workers}")
+            log(f"⚠️ No model selected. Defaulting to '{default_model}'")
         else:
             if len(selected_model_series) > 1:
                 log("⚠️ Multiple models selected. Using the first one.")
-
+            
             row = selected_model_series.iloc[0]
-            selected_model = str(row['Model_Name']).strip()
+            candidate_model = str(row.get('model_name', default_model)).strip()
+            # 取得 Model Type 並轉小寫比對 (容錯處理)
+            model_type = str(row.get('model_type', 'unknown')).strip().lower()
             
-            if 'Max_Workers' in row and pd.notna(row['Max_Workers']):
-                try:
-                    max_workers = int(float(row['Max_Workers']))
-                except ValueError:
-                    max_workers = 1
-            
-            if 'Rate_Limit_Delay' in row and pd.notna(row['Rate_Limit_Delay']):
-                try:
-                    delay_seconds = float(row['Rate_Limit_Delay'])
-                except ValueError:
-                    delay_seconds = 0.0
+            # 🔥 [核心修正] 強制檢查 Model_Type 是否為 Text
+            # 只有標註為 "Text" 的模型才支援圖轉文 (Multimodal)
+            if model_type == 'text':
+                selected_model = candidate_model
+                log(f"✓ Selected Model: {selected_model} (Type: {row.get('model_type', 'Text')})")
+            else:
+                log(f"\n⚠️  Warning: You selected '{candidate_model}' which is a '{row.get('model_type', 'Unknown')}' model.")
+                log(f"    This Content Generator requires a 'Text' type model (Multimodal).")
+                log(f"🔄  Safety Fallback: Switching to default '{default_model}' to prevent errors.\n")
+                selected_model = default_model
 
-        df_style = pd.read_excel(config_file, sheet_name='Styles_Config', engine='openpyxl').fillna('')
-        df_style.columns = df_style.columns.str.strip()
-        df_style.set_index('Style_ID', inplace=True)
+        # 2. 讀取 Concurrency Config
+        max_workers = 1
         
+        try:
+            df_concurrency = pd.read_excel(config_file, sheet_name='Concurrency_Config')
+            df_concurrency = normalize_cols(df_concurrency)
+            concurrency_dict = dict(zip(df_concurrency['parameter'].astype(str).str.upper(), df_concurrency['value']))
+            if 'MAX_WORKERS' in concurrency_dict:
+                try: max_workers = int(float(concurrency_dict['MAX_WORKERS']))
+                except: log("⚠️ Invalid MAX_WORKERS in Concurrency_Config, using default 1")
+        except Exception as e:
+            log(f"⚠️ Could not load Concurrency_Config ({e}), using defaults.")
+
+        # 3. 讀取 Styles Config
+        df_style = pd.read_excel(config_file, sheet_name='Styles_Config', engine='openpyxl').fillna('')
+        df_style = normalize_cols(df_style)
+        df_style = df_style[df_style['selection'].apply(is_selected)]
+        if 'style_id' in df_style.columns: df_style.set_index('style_id', inplace=True)
+        
+        # 4. 讀取 Process Config
         df_process = pd.read_excel(config_file, sheet_name='Process_Config', engine='openpyxl')
-        process_sheets = df_process['Product_Sheet_Name'].dropna().astype(str).tolist()
-
-        log(f"✓ Selected Model: {selected_model}")
+        
+        # Sheet Deduplication
+        raw_sheets = df_process.iloc[:, 0].dropna().astype(str).tolist()
+        unique_process_sheets = list(dict.fromkeys([s.strip() for s in raw_sheets]))
+        
         log(f"✓ Configured Workers: {max_workers}")
-        log(f"✓ Configured Delay: {delay_seconds} seconds")
-        log(f"✓ Sheets to process: {process_sheets}")
+        log(f"✓ Sheets to process (Config List): {unique_process_sheets}")
+        log(f"✓ Active Styles: {len(df_style)}")
 
-        return selected_model, df_style, process_sheets, max_workers, delay_seconds
+        return selected_model, df_style, unique_process_sheets, max_workers, 0
     except Exception as e:
         log(f"✗ Config Error: {e}")
         return None, None, None, 1, 0
-
+    
 def parse_text_output(text):
     data = {'Pin_Title': "ERROR", 'Pin_Description': "ERROR", 'Pin_Hashtags': "ERROR"}
     if not text: return data
@@ -244,11 +354,12 @@ ensure_template_exists(CONTENT_PROMPT_TEMPLATE_FILE, default_content_prompt)
 
 log("\n⏳ Loading configuration and styles from Excel...")
 config_result = load_config_and_styles(CONFIG_FILE)
-if config_result[0] is None: sys.exit()
+if config_result[0] is None:
+    input("Configuration failed. Press Enter to exit...")
+    sys.exit()
 
 selected_model, df_style, process_sheets, config_max_workers, config_delay = config_result
 
-# 雖然合併了請求，我們還是可以讀取模板內容加進去，但不分開呼叫
 image_prompt_template_content = load_template(IMAGE_PROMPT_TEMPLATE_FILE)
 content_prompt_template_content = load_template(CONTENT_PROMPT_TEMPLATE_FILE)
 
@@ -260,6 +371,7 @@ all_sheet_results = {}
 input_error_list = []
 generation_error_list = []
 used_titles = set()
+processed_real_sheets = set() # 用於防止 Sheet 重複處理
 
 log("\n⏳ Loading product data...")
 try:
@@ -267,13 +379,12 @@ try:
     actual_product_sheets = product_excel_file.sheet_names
 except Exception as e:
     log(f"❌ Error reading product file: {e}")
+    input("Press Enter to exit...")
     sys.exit()
 
-# ------------------- Auto-Retry API Wrapper -------------------
 def call_api_with_retry(api_func, *args, max_retries=5, **kwargs):
     attempt = 0
     base_wait = 10 
-    
     while attempt <= max_retries:
         try:
             return api_func(*args, **kwargs)
@@ -285,43 +396,35 @@ def call_api_with_retry(api_func, *args, max_retries=5, **kwargs):
             if any(code in error_str for code in ["400", "401", "403", "404"]):
                 log(f"❌ [FATAL] Client Error ({error_str[:50]}...). Stopping.")
                 raise e
-            retry_keywords = ["429", "too many requests", "resource_exhausted", "quota", "500", "502", "503", "504", "internal server error", "service unavailable", "gateway timeout", "socket"]
+            retry_keywords = ["429", "too many requests", "500", "502", "503", "504"]
             if any(k in error_str for k in retry_keywords):
                 attempt += 1
-                if attempt > max_retries:
-                    log(f"❌ API Retry Failed after {max_retries} attempts.")
-                    raise e
+                if attempt > max_retries: raise e
                 wait_time = (base_wait * (2 ** (attempt - 1))) + random.uniform(1, 5)
-                error_preview = "429 Too Many Requests" if "429" in error_str else "Server Error"
-                log(f"⚠️ API Issue ({error_preview}). Waiting {wait_time:.1f}s... (Retry {attempt}/{max_retries})")
                 time.sleep(wait_time)
             else:
-                log(f"❌ Unexpected Error: {error_str[:200]}")
                 raise e
-            
-# ------------------- Worker Function (Optimized Batch) -------------------
+
+# ------------------- Worker Function -------------------
 def process_single_product(product_row, style_row, sheet_name):
-    # 1. 準備資料
     product_id = str(product_row.get('Product_ID', 'Unknown')).strip()
     product_name = str(product_row.get('Product_Name', 'Unknown')).strip()
-    style_name = str(style_row.get('style_Name', 'Default')).strip()
-    local_client = global_client
+    style_name = str(style_row.get('style_name', style_row.get('Style_Name', 'Default'))).strip()
     
-    error_context = {"Source_Product_Sheet": sheet_name, "Product_ID": product_id, "Product_Name": product_name, "Error_Message": "", "Raw_Response": ""}
+    local_client = global_client
     image_name = str(product_row.get('Image_name', '')).strip()
-    image_path = os.path.join(PRODUCT_IMAGE_FOLDER, image_name)
+    image_path = os.path.join(REF_IMAGE_FOLDER, image_name)
 
-    # 2. 處理圖片
+    error_context = {"Source_Product_Sheet": sheet_name, "Product_ID": product_id, "Product_Name": product_name, "Error_Message": "", "Raw_Response": ""}
+
     try:
-        if not image_name or not os.path.isfile(image_path):
-            raise FileNotFoundError(f"Image not found: {image_name}")
-        product_image = resize_image_for_api(image_path)
+        ref_image = resize_image_for_api(image_path)
     except Exception as e:
-        error_context['Error_Message'] = f"Image Error: {str(e)}"
+        error_context['Error_Message'] = f"Image Processing Error: {str(e)}"
         return {"error": True, "details": error_context}
 
-    # 3. 建立「合併請求指令 (Combined Prompt)」
-    # 這樣我們只需要發送一次 API 請求，大幅減少 429 機率
+    mood_desc = style_row.get('mood_descriptor', style_row.get('style_description', ''))
+    
     product_info = (
         f"\n--- Product Information ---\n"
         f"Product: {product_name}\n"
@@ -329,7 +432,7 @@ def process_single_product(product_row, style_row, sheet_name):
         f"Category: {product_row.get('Category', '')}\n"
         f"Style: {style_name}\n"
         f"Keywords: {product_row.get('Base_Keywords', '')}\n"
-        f"Mood: {style_row.get('Mood_Descriptor', '')}\n"
+        f"Mood: {mood_desc}\n"
         f"Call to Action: {product_row.get('Call_To_Action', '')}\n"
     )
 
@@ -357,26 +460,17 @@ def process_single_product(product_row, style_row, sheet_name):
         parsed_output = {'Pin_Title': f"Mock Title {product_id}", 'Pin_Description': "Mock Desc", 'Pin_Hashtags': "#Mock"}
     else:
         try:
-            # 🔥 核心優化：只發送這一次請求！
             resp = call_api_with_retry(
                 local_client.models.generate_content,
                 model=selected_model,
-                contents=[product_image, combined_prompt]
+                contents=[ref_image, combined_prompt]
             )
             raw_response = extract_clean_text(resp)
             
-            # 4. 解析回傳資料 (一次解析所有欄位)
-            # 使用 Regex 抓取 [Image Prompt]
             img_prompt_match = re.search(r'\[Image Prompt\]:?\s*(.+?)(?=\n\[Title\]|$)', raw_response, re.IGNORECASE | re.DOTALL)
-            if img_prompt_match:
-                final_img_prompt = img_prompt_match.group(1).strip()
-            else:
-                final_img_prompt = "Error parsing image prompt or not provided."
-
-            # 使用原本的函式解析 Title, Description, Hashtags
+            final_img_prompt = img_prompt_match.group(1).strip() if img_prompt_match else "Error parsing image prompt or not provided."
             parsed_output = parse_text_output(raw_response)
             
-            # 5. 標題去重邏輯 (如果有重複才需要第二次請求)
             raw_title = parsed_output.get('Pin_Title', 'Untitled')
             if "ERROR" in raw_title: raw_title = "Untitled"
             normalized_title = re.sub(r'\W+', '', raw_title.lower())
@@ -386,11 +480,10 @@ def process_single_product(product_row, style_row, sheet_name):
                 if normalized_title in used_titles: need_retry = True
             
             if need_retry:
-                # 只有在極少數重複標題的情況下，才會發送第二次請求
                 regen_prompt = f"Regenerate unique Pinterest [Title] only. Do not use: {raw_title}\nFormat: [Title]: New Title"
                 try:
-                    time.sleep(1) # 重試前稍作休息
-                    resp_retry = call_api_with_retry(local_client.models.generate_content, model=selected_model, contents=[product_image, regen_prompt])
+                    time.sleep(1)
+                    resp_retry = call_api_with_retry(local_client.models.generate_content, model=selected_model, contents=[ref_image, regen_prompt])
                     new_data = parse_text_output(extract_clean_text(resp_retry))
                     if "ERROR" not in new_data.get('Pin_Title', ''):
                         raw_title = new_data['Pin_Title']
@@ -408,55 +501,107 @@ def process_single_product(product_row, style_row, sheet_name):
     keywords_list = re.findall(r'#(\w+)', raw_hashtags)
     pin_keywords = ', '.join(keywords_list)
 
-    return {'Pin_Name_For_Upload': f"{product_id}_{style_row['style_Name']}".replace(' ','_'), 'Affiliate_Link': product_row.get('Affiliate_Link', ''), 'Image_name': image_name, 'Image_Prompt_For_AI': final_img_prompt, 'Pin_Title': parsed_output.get('Pin_Title',''), 'Pin_Description': parsed_output.get('Pin_Description',''), 'Pin_Keywords': pin_keywords, 'Generated_Date': current_datetime, 'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Applied_Style_ID': style_row.name, 'Style_Name': style_row['style_Name']}
+    return {'Pin_Name_For_Upload': f"{product_id}_{style_name}".replace(' ','_'), 'Affiliate_Link': product_row.get('Affiliate_Link', ''), 'Image_name': image_name, 'Image_Prompt_For_AI': final_img_prompt, 'Pin_Title': parsed_output.get('Pin_Title',''), 'Pin_Description': parsed_output.get('Pin_Description',''), 'Pin_Keywords': pin_keywords, 'Generated_Date': current_datetime, 'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Applied_Style_ID': style_row.name, 'Style_Name': style_name}
 
 # =======================================================
-# 🔥 Main Execution (智慧切換模式)
+# 🔥 Main Execution
 # =======================================================
 if __name__ == '__main__':
     multiprocessing.freeze_support()
 
     log(f"\n⚙ Starting execution with Workers: {config_max_workers}")
     if config_max_workers == 1:
-        log("🐢 Safe Batch Mode: Single request per product to optimize speed and stability.")
+        log("🐢 Safe Batch Mode: Single request per product.")
     else:
         log(f"🐇 Multi-Thread Mode: {config_max_workers} workers.")
     
     try:
-        for sheet_name in process_sheets:
-            if sheet_name not in actual_product_sheets: continue
-            log(f"\n--- Processing: {sheet_name} ---")
+        for sheet_config_val in process_sheets:
+            # 1. 智慧比對 Sheet
+            target_sheet = None
+            config_norm = str(sheet_config_val).strip().lower()
+            for actual_s in actual_product_sheets:
+                actual_norm = str(actual_s).strip().lower()
+                if config_norm == actual_norm:
+                    target_sheet = actual_s
+                    if sheet_config_val != actual_s:
+                        log(f"✨ Smart Match: Config '{sheet_config_val}' mapped to Sheet '{target_sheet}'")
+                    break
+            
+            if not target_sheet:
+                log(f"\n⚠️  Warning: Sheet '{sheet_config_val}' not found.")
+                continue
 
-            df_products = pd.read_excel(PRODUCT_FILE, sheet_name=sheet_name, engine='openpyxl').fillna('')
+            # 🔥 [防護] Sheet 去重 (確保同一個實體 Sheet 只跑一次)
+            if target_sheet in processed_real_sheets:
+                log(f"🔄 Skipping duplicate sheet: {target_sheet} (Already processed)")
+                continue
+            processed_real_sheets.add(target_sheet)
+
+            log(f"\n--- Processing: {target_sheet} ---")
+
+            df_products = pd.read_excel(PRODUCT_FILE, sheet_name=target_sheet, engine='openpyxl').fillna('')
+            df_products.columns = df_products.columns.str.strip() 
             if 'Pinterest_Angle' in df_products.columns:
                 df_products.rename(columns={'Pinterest_Angle':'Product_desc'}, inplace=True)
 
             job_list = []
-            for idx, product_row in df_products.iterrows():
-                product_id = str(product_row.get('Product_ID', 'N/A'))
-                missing_cols = [col for col in REQUIRED_PRODUCT_COLS if col not in df_products.columns or pd.isna(product_row[col]) or str(product_row[col]).strip() == '']
-                if missing_cols:
-                    input_error_list.append({'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Error_Message': f"Missing: {missing_cols}"})
-                    continue
-                img_name = str(product_row.get('Image_name', '')).strip()
-                if not os.path.isfile(os.path.join(PRODUCT_IMAGE_FOLDER, img_name)):
-                    input_error_list.append({'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Error_Message': f"Missing Image: {img_name}"})
-                    continue 
+            
+            # 🔥 [防護] 本次 Sheet 的 Product ID 去重 (防止 Excel 裡有重複的 ID)
+            processed_product_ids_in_sheet = set()
 
+            for idx, product_row in df_products.iterrows():
+                excel_row_num = idx + 2 
+                product_id = str(product_row.get('Product_ID', 'N/A')).strip()
+                
+                # Check 0: Product ID 去重 (如果 ID 重複，直接跳過，不報錯)
+                if product_id in processed_product_ids_in_sheet:
+                    continue
+                processed_product_ids_in_sheet.add(product_id)
+
+                # Check 1: 必填欄位
+                empty_cols = [col for col in REQUIRED_PRODUCT_COLS if col not in df_products.columns or pd.isna(product_row.get(col)) or str(product_row.get(col)).strip() == '']
+                if empty_cols:
+                    input_error_list.append({
+                        'Source_Product_Sheet': target_sheet, 
+                        'Product_ID': product_id, 
+                        'Excel_Row_Index': excel_row_num, 
+                        'Error_Message': f"Skipped: Value missing in columns: {empty_cols}"
+                    })
+                    continue # 💥 發現錯誤 -> 跳過該產品所有 Style -> 確保只報錯一次
+                
+                # Check 2: 圖片檔案
+                img_name = str(product_row.get('Image_name', '')).strip()
+                img_path = os.path.join(REF_IMAGE_FOLDER, img_name)
+                
+                if not os.path.isfile(img_path):
+                    input_error_list.append({
+                        'Source_Product_Sheet': target_sheet, 
+                        'Product_ID': product_id, 
+                        'Excel_Row_Index': excel_row_num, 
+                        'Error_Message': f"Missing Image File. Excel value: '{img_name}' vs Disk Check: Not Found."
+                    })
+                    continue # 💥 發現錯誤 -> 跳過該產品所有 Style -> 確保只報錯一次
+
+                # ✅ Product 驗證通過，才開始生成任務
                 for style_id, style_row in df_style.iterrows():
-                    job_list.append((product_row, style_row, sheet_name))
+                    job_list.append((product_row, style_row, target_sheet))
                     if test_single: break
-                if test_single: break
+                
+                if test_single and job_list: break
+
+            if not job_list:
+                log(f"   (No valid jobs found in sheet '{target_sheet}'. Check Input Errors.)")
+                continue
 
             results = []
             
-            # 🔥 [核心邏輯] 
             if config_max_workers == 1:
-                # === 方案 A: 批次優化模式 (Safe Batch Mode) ===
                 total_jobs = len(job_list)
                 for i, (row, style, sheet) in enumerate(job_list):
                     try:
-                        print(f"\r   [BatchMode] Processing {i+1}/{total_jobs} ({row.get('Product_ID')} - {style['style_Name']})", end="", flush=True)
+                        s_name = style.get('style_name', 'Default')
+                        print(f"\r   [BatchMode] Processing {i+1}/{total_jobs} ({row.get('Product_ID')} - {s_name})", end="", flush=True)
                         res = process_single_product(row, style, sheet)
                         results.append(res)
                         
@@ -464,15 +609,12 @@ if __name__ == '__main__':
                             print(" -> ❌ Failed")
                         else:
                             print(" -> ✅ Done")
-                            # 成功後只需短暫休息 (因為請求數減半了)
                             if i < total_jobs - 1:
-                                # 模擬 Colab 的處理速度，不用等到 10 秒
                                 sleep_time = random.uniform(1, 3) 
                                 time.sleep(sleep_time)
                     except Exception as e:
                         print(f"\n❌ Error: {e}")
             else:
-                # === 方案 B: 多線程模式 (如果以後需要) ===
                 with ThreadPoolExecutor(max_workers=config_max_workers) as executor:
                     futures = {executor.submit(process_single_product, row, style, sheet): (row, style) for row, style, sheet in job_list}
                     completed_count = 0
@@ -491,7 +633,7 @@ if __name__ == '__main__':
             if success_data:
                 df = pd.DataFrame(success_data)
                 cols = ['Pin_Name_For_Upload', 'Affiliate_Link', 'Image_name', 'Image_Prompt_For_AI', 'Pin_Title', 'Pin_Description', 'Pin_Keywords', 'Generated_Date', 'Source_Product_Sheet', 'Product_ID', 'Applied_Style_ID', 'Style_Name']
-                all_sheet_results[sheet_name] = df[[c for c in cols if c in df.columns]]
+                all_sheet_results[target_sheet] = df[[c for c in cols if c in df.columns]]
             
             if error_data: generation_error_list.extend(error_data)
 
@@ -508,8 +650,12 @@ if __name__ == '__main__':
 
         all_errors = input_error_list + generation_error_list
         if all_errors:
-            pd.DataFrame(all_errors).to_excel(output_path_input_errors, index=False)
+            error_df = pd.DataFrame(all_errors)
+            if 'Excel_Row_Index' in error_df.columns:
+                cols = ['Source_Product_Sheet', 'Product_ID', 'Excel_Row_Index', 'Error_Message']
+                error_df = error_df[cols + [c for c in error_df.columns if c not in cols]]
+            error_df.to_excel(output_path_input_errors, index=False)
             log(f"⚠ Errors: {output_path_input_errors}")
         
         log(f"📝 Log: {LOG_FILE_PATH}")
-        if getattr(sys, 'frozen', False): input("Press Enter to exit...")
+        input("Press Enter to exit...")
