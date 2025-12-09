@@ -1,9 +1,12 @@
+print("🚀 System initializing... Please wait while libraries are loading.")
+import sys
 import os
 import re
 import time
 import warnings
 import random
-import sys  # 用於捕捉系統錯誤
+import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import dotenv_values
@@ -17,72 +20,112 @@ import multiprocessing
 # 忽略 pandas 的 FutureWarning
 warnings.filterwarnings("ignore")
 
-# ------------------- Path setup -------------------
-script_dir = os.path.dirname(os.path.abspath(__file__))
-ENV_FILE_PATH = os.path.join(script_dir, ".env")
+# =======================================================
+# 📂 核心路徑與 Log 設定
+# =======================================================
+def get_base_path():
+    """判斷 EXE 或 Python 環境，回傳根目錄"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(script_dir, "Pinterest_Affiliate_Data.xlsx")
-PRODUCT_FILE = os.path.join(script_dir, "Pinterest_Affiliate_Product.xlsx")
-OUTPUT_FOLDER = os.path.join(script_dir, "Generated_Content")
-PRODUCT_IMAGE_FOLDER = os.path.join(script_dir, "product_image")
+BASE_DIR = get_base_path()
 
-IMAGE_PROMPT_TEMPLATE_FILE = os.path.join(script_dir, "image_prompt_template.txt")
-CONTENT_PROMPT_TEMPLATE_FILE = os.path.join(script_dir, "content_prompt_template.txt")
+# 設定 Log 資料夾與檔案
+LOG_FOLDER = os.path.join(BASE_DIR, "Logs")
+os.makedirs(LOG_FOLDER, exist_ok=True)
+current_time_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+LOG_FILE_PATH = os.path.join(LOG_FOLDER, f"log-{current_time_str}.txt")
 
-# Check Paths
-for path in [CONFIG_FILE, PRODUCT_FILE]:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"❌ File not found: {path}")
+# 🔥 設定 Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[
+        logging.FileHandler(LOG_FILE_PATH, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-if not os.path.isdir(PRODUCT_IMAGE_FOLDER):
-    print(f"⚠️ Image folder not found: {PRODUCT_IMAGE_FOLDER}. Products without images will be skipped.")
+def log(msg):
+    logging.info(msg)
+
+# 🔥 啟動畫面
+print("-" * 50)
+log(f"🚀 Pinterest Content Generator (Optimized Batch Mode)")
+log(f"📂 Working Directory: {BASE_DIR}")
+log(f"📝 Log file: {LOG_FILE_PATH}")
+print("-" * 50)
+
+# 設定其他檔案路徑
+ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+CONFIG_FILE = os.path.join(BASE_DIR, "Pinterest_Affiliate_Data.xlsx")
+PRODUCT_FILE = os.path.join(BASE_DIR, "Pinterest_Affiliate_Product.xlsx")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "Generated_Content")
+PRODUCT_IMAGE_FOLDER = os.path.join(BASE_DIR, "product_image")
+
+IMAGE_PROMPT_TEMPLATE_FILE = os.path.join(BASE_DIR, "image_prompt_template.txt")
+CONTENT_PROMPT_TEMPLATE_FILE = os.path.join(BASE_DIR, "content_prompt_template.txt")
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+# 檢查必要檔案
+missing_files = []
+for path in [CONFIG_FILE, PRODUCT_FILE]:
+    if not os.path.isfile(path):
+        missing_files.append(os.path.basename(path))
+
+if missing_files:
+    log(f"\n❌ Critical Error: Missing required files in {BASE_DIR}:")
+    for f in missing_files:
+        log(f"   - {f}")
+    input("Press Enter to exit...")
+    sys.exit(1)
+
+if not os.path.isdir(PRODUCT_IMAGE_FOLDER):
+    log(f"⚠️ Image folder not found: {PRODUCT_IMAGE_FOLDER}. Products without images will be skipped.")
+
 # ------------------- Interactive settings -------------------
-print("--- Configuration Setup ---")
-test_single = input("Run single test mode? (Y/N): ").strip().lower() == 'y'
-verbose_debug = input("Enable detailed debug output? (Y/N): ").strip().lower() == 'y'
-require_affiliate_link = input("Is 'Affiliate_Link' a required field? (Y/N): ").strip().lower() == 'y'
+log("\n--- Configuration Setup ---")
+test_single_input = input("Run single test mode? (Y/N): ").strip().lower()
+test_single = test_single_input == 'y'
+
+require_affiliate_input = input("Is 'Affiliate_Link' a required field? (Y/N): ").strip().lower()
+require_affiliate_link = require_affiliate_input == 'y'
 
 BASE_REQUIRED_COLS = ['Product_ID', 'Product_Name', 'Image_name', 'Product_desc']
 REQUIRED_PRODUCT_COLS = BASE_REQUIRED_COLS.copy()
 
 if require_affiliate_link:
     REQUIRED_PRODUCT_COLS.append('Affiliate_Link')
-    print("✓ 'Affiliate_Link' will be validated as a required field.")
-else:
-    print("✓ 'Affiliate_Link' will be treated as an optional field.")
 
 # ------------------- API Setup -------------------
-print("\n--- Loading configuration and API key ---")
+log("\n--- Loading API key ---")
 env_config = dotenv_values(ENV_FILE_PATH)
 GEMINI_API_KEY = env_config.get("GEMINI_API_KEY")
 
 use_mock = False
-client = None
+global_client = None 
 
 if not GEMINI_API_KEY:
-    print("⚠️ GEMINI_API_KEY not detected in .env file.")
+    log(f"⚠️ GEMINI_API_KEY not detected.")
     use_mock = input("   Use simulation mode? (Y/N): ").strip().lower() == 'y'
     if not use_mock:
-        print("❌ API key missing and simulation mode not selected. Program terminated.")
-        exit()
-    else:
-        print("✓ Running in simulation mode. No API calls will be made.")
+        sys.exit()
 else:
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print(f"❌ Failed to initialize Gemini Client: {e}")
-        exit()
+    if not use_mock:
+        try:
+            # 🔥 保持全域 Client 優化，避免重複連線
+            global_client = genai.Client(api_key=GEMINI_API_KEY)
+            log("✓ Global Gemini Client initialized.")
+        except Exception as e:
+            log(f"❌ Failed to initialize Client: {e}")
+            sys.exit(1)
 
 # ------------------- Helper functions -------------------
-def debug_print(tag, text):
-    if verbose_debug:
-        print(f"\n========== {tag} ==========")
-        print(text.strip() if text else "⚠️ No response text")
-        print("===========================================\n")
+title_lock = threading.Lock()
 
 def extract_clean_text(response):
     try:
@@ -100,7 +143,6 @@ def ensure_template_exists(path, default_text):
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(default_text.strip())
-        print(f"🆕 Created default template: {os.path.basename(path)}")
 
 def load_template(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -109,14 +151,23 @@ def load_template(path):
 def render_template(template_str):
     return Template(template_str).render()
 
+def resize_image_for_api(image_path, max_length=1024):
+    """讀取並縮小圖片以加快上傳與處理"""
+    try:
+        img = Image.open(image_path)
+        if max(img.size) > max_length:
+            ratio = max_length / max(img.size)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        return img
+    except Exception as e:
+        raise Exception(f"Failed to resize image: {e}")
+
+# 🔥 設定讀取邏輯
 def load_config_and_styles(config_file):
     try:
         df_model = pd.read_excel(config_file, sheet_name='Model_Config')
-        df_model.columns = df_model.columns.str.strip()
-
-        if verbose_debug:
-            print("\n🔍 [DEBUG] Model Config Raw Data:")
-            print(df_model[['Model_Name', 'Selection', 'Max_Workers']].head())
+        df_model.columns = df_model.columns.str.strip() 
 
         def is_selected(val):
             s = str(val).strip().lower()
@@ -124,51 +175,51 @@ def load_config_and_styles(config_file):
 
         selected_model_series = df_model[df_model['Selection'].apply(is_selected)]
         
-        selected_model = "gemini-2.0-flash-exp"
-        max_workers = 3
-        delay_seconds = 0
+        selected_model = "gemini-2.0-flash" # 預設使用 2.0-flash
+        max_workers = 1 
+        delay_seconds = 0.0
 
         if selected_model_series.empty:
-            print(f"⚠️ No model selected. Defaulting to '{selected_model}', Workers: {max_workers}")
+            log(f"⚠️ No model selected. Defaulting to '{selected_model}', Workers: {max_workers}")
         else:
             if len(selected_model_series) > 1:
-                print("⚠️ Multiple models selected. Using the first one.")
+                log("⚠️ Multiple models selected. Using the first one.")
 
             row = selected_model_series.iloc[0]
             selected_model = str(row['Model_Name']).strip()
+            
             if 'Max_Workers' in row and pd.notna(row['Max_Workers']):
                 try:
                     max_workers = int(float(row['Max_Workers']))
                 except ValueError:
                     max_workers = 1
+            
             if 'Rate_Limit_Delay' in row and pd.notna(row['Rate_Limit_Delay']):
                 try:
-                    delay_seconds = int(float(row['Rate_Limit_Delay']))
+                    delay_seconds = float(row['Rate_Limit_Delay'])
                 except ValueError:
-                    delay_seconds = 0
+                    delay_seconds = 0.0
 
         df_style = pd.read_excel(config_file, sheet_name='Styles_Config', engine='openpyxl').fillna('')
         df_style.columns = df_style.columns.str.strip()
         df_style.set_index('Style_ID', inplace=True)
-        df_style.index = df_style.index.astype(str)
-
+        
         df_process = pd.read_excel(config_file, sheet_name='Process_Config', engine='openpyxl')
         process_sheets = df_process['Product_Sheet_Name'].dropna().astype(str).tolist()
 
-        print(f"✓ Selected Model: {selected_model}")
-        print(f"✓ Configured Workers: {max_workers}")
-        print(f"✓ Configured Delay: {delay_seconds} seconds")
-        print(f"✓ Sheets to process: {process_sheets}")
-        
-        return selected_model, df_style, process_sheets, max_workers, delay_seconds
+        log(f"✓ Selected Model: {selected_model}")
+        log(f"✓ Configured Workers: {max_workers}")
+        log(f"✓ Configured Delay: {delay_seconds} seconds")
+        log(f"✓ Sheets to process: {process_sheets}")
 
+        return selected_model, df_style, process_sheets, max_workers, delay_seconds
     except Exception as e:
-        print(f"✗ Error loading configuration: {e}")
+        log(f"✗ Config Error: {e}")
         return None, None, None, 1, 0
 
 def parse_text_output(text):
     data = {'Pin_Title': "ERROR", 'Pin_Description': "ERROR", 'Pin_Hashtags': "ERROR"}
-    if not text or not isinstance(text, str): return data
+    if not text: return data
     cleaned = text.strip()
     patterns = {
         'Pin_Title': re.search(r'(?:\[|\*\*|^)?\s*title\s*(?:\]|\*\*|:)?\s*[:：\-]?\s*(.+?)(?=\n(?:\[|\*\*|^)?\s*description|\n(?:\[|\*\*|^)?\s*hashtags|$)', cleaned, re.IGNORECASE | re.DOTALL),
@@ -185,97 +236,92 @@ def parse_text_output(text):
         if hashtags: data['Pin_Hashtags'] = ' '.join(hashtags)
     return data
 
-# ------------------- Templates & Config -------------------
-default_image_prompt = """
-You are a creative AI image prompt designer.
-Create a detailed visual prompt for Pinterest-style imagery.
-"""
-
-default_content_prompt = """
-You are a Pinterest affiliate marketing copywriter.
-Write engaging Pinterest content.
-"""
-
+# --- LOAD CONFIGURATION ---
+default_image_prompt = "Create a detailed visual prompt for Pinterest-style imagery."
+default_content_prompt = "Write engaging Pinterest content."
 ensure_template_exists(IMAGE_PROMPT_TEMPLATE_FILE, default_image_prompt)
 ensure_template_exists(CONTENT_PROMPT_TEMPLATE_FILE, default_content_prompt)
 
-# --- LOAD CONFIGURATION ---
+log("\n⏳ Loading configuration and styles from Excel...")
 config_result = load_config_and_styles(CONFIG_FILE)
-if config_result[0] is None:
-    print("❌ Program terminated: configuration error.")
-    exit()
+if config_result[0] is None: sys.exit()
 
 selected_model, df_style, process_sheets, config_max_workers, config_delay = config_result
 
-image_prompt_template = load_template(IMAGE_PROMPT_TEMPLATE_FILE)
-content_prompt_template = load_template(CONTENT_PROMPT_TEMPLATE_FILE)
+# 雖然合併了請求，我們還是可以讀取模板內容加進去，但不分開呼叫
+image_prompt_template_content = load_template(IMAGE_PROMPT_TEMPLATE_FILE)
+content_prompt_template_content = load_template(CONTENT_PROMPT_TEMPLATE_FILE)
 
 current_datetime = datetime.now().strftime("%Y%m%d%H%M")
 output_path_generated = os.path.join(OUTPUT_FOLDER, f"Generated_Content_{current_datetime}.xlsx")
-output_path_input_errors = os.path.join(script_dir, f"Input_Errors_{current_datetime}.xlsx")
+output_path_input_errors = os.path.join(BASE_DIR, f"Input_Errors_{current_datetime}.xlsx")
 
-# 初始化全域變數 (保證在 finally 區塊能被讀取)
 all_sheet_results = {}
 input_error_list = []
 generation_error_list = []
 used_titles = set()
 
+log("\n⏳ Loading product data...")
 try:
     product_excel_file = pd.ExcelFile(PRODUCT_FILE)
     actual_product_sheets = product_excel_file.sheet_names
-    print(f"✓ Product file loaded. Found sheets: {actual_product_sheets}")
 except Exception as e:
-    print(f"❌ Fatal Error: Could not read the product file '{PRODUCT_FILE}'. Error: {e}")
-    exit()
+    log(f"❌ Error reading product file: {e}")
+    sys.exit()
 
 # ------------------- Auto-Retry API Wrapper -------------------
-def call_api_with_retry(api_func, *args, max_retries=5, initial_wait=10, **kwargs):
+def call_api_with_retry(api_func, *args, max_retries=5, **kwargs):
     attempt = 0
+    base_wait = 10 
+    
     while attempt <= max_retries:
         try:
             return api_func(*args, **kwargs)
         except Exception as e:
-            error_str = str(e)
-            # 偵測 Quota 錯誤
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            error_str = str(e).lower()
+            if "limit: 0" in error_str or "limit=0" in error_str:
+                log(f"❌ [FATAL] Quota is ZERO (Limit: 0). Stopping.")
+                raise e 
+            if any(code in error_str for code in ["400", "401", "403", "404"]):
+                log(f"❌ [FATAL] Client Error ({error_str[:50]}...). Stopping.")
+                raise e
+            retry_keywords = ["429", "too many requests", "resource_exhausted", "quota", "500", "502", "503", "504", "internal server error", "service unavailable", "gateway timeout", "socket"]
+            if any(k in error_str for k in retry_keywords):
                 attempt += 1
                 if attempt > max_retries:
+                    log(f"❌ API Retry Failed after {max_retries} attempts.")
                     raise e
-                wait_time = (initial_wait * (2 ** (attempt - 1))) + random.uniform(1, 5)
-                print(f"⚠️ API Quota Hit (429). Retrying in {wait_time:.1f}s... (Attempt {attempt}/{max_retries})")
+                wait_time = (base_wait * (2 ** (attempt - 1))) + random.uniform(1, 5)
+                error_preview = "429 Too Many Requests" if "429" in error_str else "Server Error"
+                log(f"⚠️ API Issue ({error_preview}). Waiting {wait_time:.1f}s... (Retry {attempt}/{max_retries})")
                 time.sleep(wait_time)
             else:
+                log(f"❌ Unexpected Error: {error_str[:200]}")
                 raise e
-
-# ------------------- Worker Function -------------------
+            
+# ------------------- Worker Function (Optimized Batch) -------------------
 def process_single_product(product_row, style_row, sheet_name):
+    # 1. 準備資料
     product_id = str(product_row.get('Product_ID', 'Unknown')).strip()
     product_name = str(product_row.get('Product_Name', 'Unknown')).strip()
     style_name = str(style_row.get('style_Name', 'Default')).strip()
+    local_client = global_client
     
-    # 簡化 Log，只顯示開始
-    print(f"→ Start: {product_id} [{style_name}]")
-    
-    error_context = {
-        "Source_Product_Sheet": sheet_name,
-        "Product_ID": product_id,
-        "Product_Name": product_name,
-        "Style_Name": style_name,
-        "Error_Message": "",
-        "Raw_Response": ""
-    }
-
+    error_context = {"Source_Product_Sheet": sheet_name, "Product_ID": product_id, "Product_Name": product_name, "Error_Message": "", "Raw_Response": ""}
     image_name = str(product_row.get('Image_name', '')).strip()
     image_path = os.path.join(PRODUCT_IMAGE_FOLDER, image_name)
 
+    # 2. 處理圖片
     try:
         if not image_name or not os.path.isfile(image_path):
             raise FileNotFoundError(f"Image not found: {image_name}")
-        product_image = Image.open(image_path)
+        product_image = resize_image_for_api(image_path)
     except Exception as e:
         error_context['Error_Message'] = f"Image Error: {str(e)}"
         return {"error": True, "details": error_context}
 
+    # 3. 建立「合併請求指令 (Combined Prompt)」
+    # 這樣我們只需要發送一次 API 請求，大幅減少 429 機率
     product_info = (
         f"\n--- Product Information ---\n"
         f"Product: {product_name}\n"
@@ -287,78 +333,72 @@ def process_single_product(product_row, style_row, sheet_name):
         f"Call to Action: {product_row.get('Call_To_Action', '')}\n"
     )
 
-    format_instructions = (
-        "\n\nIMPORTANT: You must format your response exactly as follows:\n"
-        "[Title]: (Your catchy title here)\n"
-        "[Description]: (Your description here)\n"
-        "[Hashtags]: (Your hashtags here)\n"
+    combined_prompt = (
+        f"You are a professional Pinterest Content Manager.\n"
+        f"Analyze the attached image and the product details below:\n"
+        f"{product_info}\n\n"
+        f"Please generate 4 distinct outputs in a structured format:\n"
+        f"1. A detailed text-to-image prompt for AI image generation (based on: {image_prompt_template_content})\n"
+        f"2. A catchy Pinterest Pin Title\n"
+        f"3. An engaging Pin Description (based on: {content_prompt_template_content})\n"
+        f"4. Relevant Hashtags\n\n"
+        f"⚠️ IMPORTANT: You must output the result strictly in this format (do not add intro text):\n"
+        f"[Image Prompt]: (Write the detailed image prompt here)\n"
+        f"[Title]: (Write the title here)\n"
+        f"[Description]: (Write the description here)\n"
+        f"[Hashtags]: (Write the hashtags here)\n"
     )
 
-    img_prompt = render_template(image_prompt_template) + "\n" + product_info
-    content_prompt = render_template(content_prompt_template) + "\n" + product_info + format_instructions
+    final_img_prompt = ""
+    parsed_output = {}
 
     if use_mock:
-        final_img_prompt = "Simulated Image Prompt"
-        parsed_output = {'Pin_Title': f"Simulated Title {product_id}", 'Pin_Description': "Simulated Desc", 'Pin_Hashtags': "#Simulated"}
-        raw_api_response = "Simulation Mode"
-        if config_delay > 0: time.sleep(config_delay)
+        final_img_prompt = "Simulated Prompt"
+        parsed_output = {'Pin_Title': f"Mock Title {product_id}", 'Pin_Description': "Mock Desc", 'Pin_Hashtags': "#Mock"}
     else:
         try:
-            # 1. Generate Image Prompt
-            try:
-                resp_img = call_api_with_retry(
-                    client.models.generate_content, 
-                    model=selected_model, 
-                    contents=[product_image, img_prompt]
-                )
-                final_img_prompt = extract_clean_text(resp_img)
-            except Exception as e:
-                final_img_prompt = f"IMAGE PROMPT ERROR: {str(e)}"
-
-            # 2. Generate Content
-            resp_text = call_api_with_retry(
-                client.models.generate_content,
+            # 🔥 核心優化：只發送這一次請求！
+            resp = call_api_with_retry(
+                local_client.models.generate_content,
                 model=selected_model,
-                contents=[product_image, content_prompt]
+                contents=[product_image, combined_prompt]
             )
-            raw_api_response = extract_clean_text(resp_text)
+            raw_response = extract_clean_text(resp)
             
-            parsed_output = parse_text_output(raw_api_response)
+            # 4. 解析回傳資料 (一次解析所有欄位)
+            # 使用 Regex 抓取 [Image Prompt]
+            img_prompt_match = re.search(r'\[Image Prompt\]:?\s*(.+?)(?=\n\[Title\]|$)', raw_response, re.IGNORECASE | re.DOTALL)
+            if img_prompt_match:
+                final_img_prompt = img_prompt_match.group(1).strip()
+            else:
+                final_img_prompt = "Error parsing image prompt or not provided."
 
-            has_gen_error = ("ERROR:" in parsed_output['Pin_Title'] or "ERROR:" in parsed_output['Pin_Description'])
-
-            if has_gen_error:
-                error_context['Error_Message'] = "Parsing Error (Content missing or wrong format)"
-                error_context['Raw_Response'] = raw_api_response
-                return {"error": True, "details": error_context}
-
-            # Retry Logic for Duplicate Titles
-            MAX_RETRY = 3
-            raw_title = parsed_output['Pin_Title'].strip()
+            # 使用原本的函式解析 Title, Description, Hashtags
+            parsed_output = parse_text_output(raw_response)
+            
+            # 5. 標題去重邏輯 (如果有重複才需要第二次請求)
+            raw_title = parsed_output.get('Pin_Title', 'Untitled')
+            if "ERROR" in raw_title: raw_title = "Untitled"
             normalized_title = re.sub(r'\W+', '', raw_title.lower())
-            retry_count = 0
-            while normalized_title in used_titles and retry_count < MAX_RETRY:
-                retry_count += 1
-                regen_prompt = f"Regenerate unique Pinterest [Title]. Do not use: {raw_title}\nFormat: [Title]: New Title"
+            
+            need_retry = False
+            with title_lock:
+                if normalized_title in used_titles: need_retry = True
+            
+            if need_retry:
+                # 只有在極少數重複標題的情況下，才會發送第二次請求
+                regen_prompt = f"Regenerate unique Pinterest [Title] only. Do not use: {raw_title}\nFormat: [Title]: New Title"
                 try:
-                    resp_retry = call_api_with_retry(
-                        client.models.generate_content,
-                        model=selected_model,
-                        contents=[product_image, regen_prompt]
-                    )
+                    time.sleep(1) # 重試前稍作休息
+                    resp_retry = call_api_with_retry(local_client.models.generate_content, model=selected_model, contents=[product_image, regen_prompt])
                     new_data = parse_text_output(extract_clean_text(resp_retry))
-                    if "ERROR" not in new_data['Pin_Title']:
+                    if "ERROR" not in new_data.get('Pin_Title', ''):
                         raw_title = new_data['Pin_Title']
                         normalized_title = re.sub(r'\W+', '', raw_title.lower())
-                except Exception: break
+                except: pass
             
-            used_titles.add(normalized_title)
+            with title_lock: used_titles.add(normalized_title)
             parsed_output['Pin_Title'] = raw_title
-
-            # Configured Delay
-            if config_delay > 0:
-                print(f"⏳ Sleeping {config_delay}s...")
-                time.sleep(config_delay)
 
         except Exception as e:
             error_context['Error_Message'] = f"API Error: {str(e)}"
@@ -368,126 +408,108 @@ def process_single_product(product_row, style_row, sheet_name):
     keywords_list = re.findall(r'#(\w+)', raw_hashtags)
     pin_keywords = ', '.join(keywords_list)
 
-    return {
-        'Pin_Name_For_Upload': f"{product_id}_{style_row['style_Name']}".replace(' ','_'),
-        'Affiliate_Link': product_row.get('Affiliate_Link', ''),
-        'Image_name': image_name,
-        'Image_Prompt_For_AI': final_img_prompt,
-        'Pin_Title': parsed_output['Pin_Title'],
-        'Pin_Description': parsed_output['Pin_Description'],
-        'Pin_Keywords': pin_keywords,
-        'Generated_Date': current_datetime,
-        'Source_Product_Sheet': sheet_name,
-        'Product_ID': product_id,
-        'Applied_Style_ID': style_row.name,
-        'Style_Name': style_row['style_Name']
-    }
-
+    return {'Pin_Name_For_Upload': f"{product_id}_{style_row['style_Name']}".replace(' ','_'), 'Affiliate_Link': product_row.get('Affiliate_Link', ''), 'Image_name': image_name, 'Image_Prompt_For_AI': final_img_prompt, 'Pin_Title': parsed_output.get('Pin_Title',''), 'Pin_Description': parsed_output.get('Pin_Description',''), 'Pin_Keywords': pin_keywords, 'Generated_Date': current_datetime, 'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Applied_Style_ID': style_row.name, 'Style_Name': style_row['style_Name']}
 
 # =======================================================
-# 🔥 核心執行區塊 (包含 Try-Finally 強制存檔機制) 🔥
+# 🔥 Main Execution (智慧切換模式)
 # =======================================================
-print(f"\n⚙ Starting execution with {config_max_workers} workers (Auto-Retry enabled).\n")
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
 
-try:
-    for sheet_name in process_sheets:
-        if sheet_name not in actual_product_sheets:
-            print(f"\n⚠️ Skipping sheet '{sheet_name}' (not found in product file)")
-            continue
+    log(f"\n⚙ Starting execution with Workers: {config_max_workers}")
+    if config_max_workers == 1:
+        log("🐢 Safe Batch Mode: Single request per product to optimize speed and stability.")
+    else:
+        log(f"🐇 Multi-Thread Mode: {config_max_workers} workers.")
+    
+    try:
+        for sheet_name in process_sheets:
+            if sheet_name not in actual_product_sheets: continue
+            log(f"\n--- Processing: {sheet_name} ---")
 
-        print(f"\n--- Processing sheet: {sheet_name} ---")
+            df_products = pd.read_excel(PRODUCT_FILE, sheet_name=sheet_name, engine='openpyxl').fillna('')
+            if 'Pinterest_Angle' in df_products.columns:
+                df_products.rename(columns={'Pinterest_Angle':'Product_desc'}, inplace=True)
 
-        df_products = pd.read_excel(PRODUCT_FILE, sheet_name=sheet_name, engine='openpyxl').fillna('')
-        if 'Pinterest_Angle' in df_products.columns:
-            df_products.rename(columns={'Pinterest_Angle':'Product_desc'}, inplace=True)
+            job_list = []
+            for idx, product_row in df_products.iterrows():
+                product_id = str(product_row.get('Product_ID', 'N/A'))
+                missing_cols = [col for col in REQUIRED_PRODUCT_COLS if col not in df_products.columns or pd.isna(product_row[col]) or str(product_row[col]).strip() == '']
+                if missing_cols:
+                    input_error_list.append({'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Error_Message': f"Missing: {missing_cols}"})
+                    continue
+                img_name = str(product_row.get('Image_name', '')).strip()
+                if not os.path.isfile(os.path.join(PRODUCT_IMAGE_FOLDER, img_name)):
+                    input_error_list.append({'Source_Product_Sheet': sheet_name, 'Product_ID': product_id, 'Error_Message': f"Missing Image: {img_name}"})
+                    continue 
 
-        job_list = []
-        for idx, product_row in df_products.iterrows():
-            missing_cols = [col for col in REQUIRED_PRODUCT_COLS if col not in df_products.columns or pd.isna(product_row[col]) or str(product_row[col]).strip() == '']
-            if missing_cols:
-                error_details = {'Source_Product_Sheet': sheet_name, 'Product_ID': str(product_row.get('Product_ID', 'N/A')), 'Error_Message': f"Missing fields: {missing_cols}"}
-                input_error_list.append(error_details)
-                continue
-
-            for style_id, style_row in df_style.iterrows():
-                job_list.append((product_row, style_row, sheet_name))
+                for style_id, style_row in df_style.iterrows():
+                    job_list.append((product_row, style_row, sheet_name))
+                    if test_single: break
                 if test_single: break
-            if test_single: break
 
-        results = []
+            results = []
+            
+            # 🔥 [核心邏輯] 
+            if config_max_workers == 1:
+                # === 方案 A: 批次優化模式 (Safe Batch Mode) ===
+                total_jobs = len(job_list)
+                for i, (row, style, sheet) in enumerate(job_list):
+                    try:
+                        print(f"\r   [BatchMode] Processing {i+1}/{total_jobs} ({row.get('Product_ID')} - {style['style_Name']})", end="", flush=True)
+                        res = process_single_product(row, style, sheet)
+                        results.append(res)
+                        
+                        if res.get('error'):
+                            print(" -> ❌ Failed")
+                        else:
+                            print(" -> ✅ Done")
+                            # 成功後只需短暫休息 (因為請求數減半了)
+                            if i < total_jobs - 1:
+                                # 模擬 Colab 的處理速度，不用等到 10 秒
+                                sleep_time = random.uniform(1, 3) 
+                                time.sleep(sleep_time)
+                    except Exception as e:
+                        print(f"\n❌ Error: {e}")
+            else:
+                # === 方案 B: 多線程模式 (如果以後需要) ===
+                with ThreadPoolExecutor(max_workers=config_max_workers) as executor:
+                    futures = {executor.submit(process_single_product, row, style, sheet): (row, style) for row, style, sheet in job_list}
+                    completed_count = 0
+                    total_count = len(futures)
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                            completed_count += 1
+                            print(f"\r   [ThreadMode] Progress {completed_count}/{total_count}...", end="", flush=True)
+                        except Exception: pass
+                print("") 
+
+            success_data = [r for r in results if isinstance(r, dict) and not r.get('error')]
+            error_data = [r['details'] for r in results if isinstance(r, dict) and r.get('error')]
+
+            if success_data:
+                df = pd.DataFrame(success_data)
+                cols = ['Pin_Name_For_Upload', 'Affiliate_Link', 'Image_name', 'Image_Prompt_For_AI', 'Pin_Title', 'Pin_Description', 'Pin_Keywords', 'Generated_Date', 'Source_Product_Sheet', 'Product_ID', 'Applied_Style_ID', 'Style_Name']
+                all_sheet_results[sheet_name] = df[[c for c in cols if c in df.columns]]
+            
+            if error_data: generation_error_list.extend(error_data)
+
+    except KeyboardInterrupt:
+        log("\n🛑 Interrupted! Saving data...")
+    except Exception as e:
+        log(f"\n❌ Error: {e}")
+    finally:
+        log("\n--- Saving Results ---")
+        if all_sheet_results:
+            with pd.ExcelWriter(output_path_generated, engine='openpyxl') as writer:
+                for sheet, df in all_sheet_results.items(): df.to_excel(writer, sheet_name=sheet, index=False)
+            log(f"✓ Results: {output_path_generated}")
+
+        all_errors = input_error_list + generation_error_list
+        if all_errors:
+            pd.DataFrame(all_errors).to_excel(output_path_input_errors, index=False)
+            log(f"⚠ Errors: {output_path_input_errors}")
         
-        with ThreadPoolExecutor(max_workers=config_max_workers) as executor:
-            futures = {executor.submit(process_single_product, row, style, sheet): (row, style)
-                    for row, style, sheet in job_list}
-
-            completed_count = 0
-            total_count = len(futures)
-
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                    completed_count += 1
-                    # 顯示進度，讓你確認它還活著
-                    if completed_count % 1 == 0:
-                        print(f"   [Progress] {completed_count}/{total_count} done.")
-                except Exception as e:
-                    print(f"❌ Thread Error: {e}")
-
-        success_data = [r for r in results if isinstance(r, dict) and not r.get('error')]
-        error_data = [r['details'] for r in results if isinstance(r, dict) and r.get('error')]
-
-        if success_data:
-            df_result = pd.DataFrame(success_data)
-            cols_order = ['Pin_Name_For_Upload', 'Affiliate_Link', 'Image_name', 'Image_Prompt_For_AI', 'Pin_Title', 'Pin_Description', 'Pin_Keywords', 'Generated_Date', 'Source_Product_Sheet', 'Product_ID', 'Applied_Style_ID', 'Style_Name']
-            final_cols = [c for c in cols_order if c in df_result.columns]
-            all_sheet_results[sheet_name] = df_result[final_cols]
-        
-        if error_data:
-            generation_error_list.extend(error_data)
-
-except KeyboardInterrupt:
-    print("\n\n🛑 User interrupted! Saving collected data before exiting...")
-except Exception as e:
-    print(f"\n\n❌ Critical Error: {e}. Saving collected data before crashing...")
-finally:
-    # ------------------- Save Outputs (保命區塊) -------------------
-    print("\n--- Saving Results (Data Rescue) ---")
-
-    if all_sheet_results or generation_error_list:
-        try:
-            # 確保檔案沒有被打開，若打開則存成新檔名
-            try:
-                with pd.ExcelWriter(output_path_generated, engine='openpyxl') as writer:
-                    for sheet_name, df_result in all_sheet_results.items():
-                        if not df_result.empty:
-                            df_result.to_excel(writer, sheet_name=sheet_name, index=False)
-                            print(f"✓ Sheet saved: {sheet_name} ({len(df_result)} rows)")
-                    
-                    if generation_error_list:
-                        pd.DataFrame(generation_error_list).to_excel(writer, sheet_name='Generation_Errors', index=False)
-                        print(f"⚠ Generation Errors saved ({len(generation_error_list)} rows)")
-                print(f"✓ Full Report saved to: {output_path_generated}")
-            except PermissionError:
-                # 萬一你忘記關閉 Excel，它會嘗試換個檔名存檔，而不是直接報錯
-                new_path = output_path_generated.replace(".xlsx", "_RESCUED.xlsx")
-                print(f"⚠️ Original file is open! Saving to: {new_path}")
-                with pd.ExcelWriter(new_path, engine='openpyxl') as writer:
-                    for sheet_name, df_result in all_sheet_results.items():
-                        if not df_result.empty:
-                            df_result.to_excel(writer, sheet_name=sheet_name, index=False)
-                    if generation_error_list:
-                        pd.DataFrame(generation_error_list).to_excel(writer, sheet_name='Generation_Errors', index=False)
-                print(f"✓ Rescued Data saved to: {new_path}")
-
-        except Exception as e:
-            print(f"❌ Error saving output Excel: {e}")
-
-    if input_error_list:
-        try:
-            pd.DataFrame(input_error_list).to_excel(output_path_input_errors, index=False)
-            print(f"⚠ Input Errors logged to: {output_path_input_errors}")
-        except Exception as e:
-            print(f"❌ Error saving input errors: {e}")
-
-    print("\n--- Execution Finished ---")
+        log(f"📝 Log: {LOG_FILE_PATH}")
+        if getattr(sys, 'frozen', False): input("Press Enter to exit...")

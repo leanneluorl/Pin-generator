@@ -1,10 +1,15 @@
 I need to use the Gemini API to generate content and image prompts for Pinterest Pins.
 I will read the product sheet names (which can vary in number) from the Product_Sheet_Name column in the Process_Config sheet of my Pinterest_Affiliate_Data.xlsx file. I will also read the contents of the Styles_Config sheet to define the styles for prompt generation (each product will generate content for every specified style).
-The product content itself will come from my Excel file, Pinterest_Affiliate_Product.xlsx, using the following columns for each row: Product_ID, Product_Name, Affiliate_Link, Image_name, Category, Base_Keywords, Product_desc, Call_To_Action. The Image_name column will include the file extension. Both the images and the Excel files will be stored in my Google Drive.
+The product content itself will come from my Excel file, Pinterest_Affiliate_Product.xlsx, using the following columns for each row: Product_ID, Product_Name, Affiliate_Link, Image_name, Category, Base_Keywords, Product_desc, Call_To_Action. 
+The Image_name column will include the file extension. Both the images and the Excel files will be stored in my Google Drive.
+
+
 The output should be an Excel file named Generated_Content_[timestamp].xlsx. This output file should be structured similarly to Generated_Content_202511241804.xlsx, with the following columns: Pin_Name_For_Upload, Affiliate_Link, Image_name, Image_Prompt_For_AI, Pin_Title, Pin_Description, Pin_Keywords, Generated_Date, Source_Product_Sheet, Product_ID, Applied_Style_ID, Style_Name. All rows should be populated with the original product content, AI-generated content, and style-related information.
+The Pin_Name_For_Upload should be generated as [Product_ID] + "_" + [Style_Name].
+
 Please instruct me on how to read files from Google Drive in Google Colab and how to save the generated output file back to Google Drive.
 When processing each row, the product image needs to be uploaded as a reference for the AI.
-The Pin_Name_For_Upload should be generated as [Product_ID] + "_" + [Style_Name].
+
 Please consolidate all this information into a complete Python program.
 
 Note: Don't use mime_type to upload image, use something like below
