@@ -305,9 +305,18 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
 # 🧩 核心處理邏輯 (Process Item)
 # =======================================================
 # 🔥 修改點 1: 在最後面新增 excel_filename 參數
+# =======================================================
+# 🧩 核心處理邏輯 (Process Item) - API 參數優化版
+# =======================================================
+# =======================================================
+# 🧩 核心處理邏輯 (Process Item) - 修正 Imagen 參數版
+# =======================================================
 def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings, excel_filename):
     """
-    雙引擎處理邏輯 + 顯示存檔路徑 (最終版：自動建立資料夾 + 自動偵測副檔名)
+    雙引擎處理邏輯 (Gemini & Imagen)
+    - 修正：移除 Imagen 不支援的 person_generation 參數
+    - 保留：API 參數傳遞 Aspect Ratio
+    - 保留：Pin_Name_For_Upload 檔名邏輯
     """
     try:
         item_id = str(row[col_map['ID']] if col_map['ID'] in row else 'Unknown').strip()
@@ -315,18 +324,27 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
     except:
         return {"error": "Column read error"}
     
-    # 處理 Aspect Ratio
+    # --- 1. 處理 Aspect Ratio 格式 ---
     ar_val = str(target_ratio if target_ratio else '1:1').strip()
-    if ar_val.count(':') == 2: ar_val = ar_val.rsplit(':', 1)[0]
-    if ar_val.startswith('0'): ar_val = ar_val[1:]
+    
+    # 清理秒數 (例如 09:16:00 -> 09:16)
+    if ar_val.count(':') >= 2: 
+        ar_val = ar_val.rsplit(':', 1)[0]
+    
+    # 清理開頭 0 (例如 09:16 -> 9:16)
+    if ar_val.startswith('0'): 
+        ar_val = ar_val[1:]
+        
+    # 產生檔名用的比例字串 (用 x 代替 :)
     ratio_name = ar_val.replace(':', 'x')
     
-    final_prompt_text = f"{instruction}\n\nAspect Ratio: {ar_val}\nPrompt: {prompt_text}"
+    # --- 2. 組合 Prompt ---
+    final_prompt_text = f"{instruction}\n\nPrompt: {prompt_text}"
 
     image_bytes = None
     input_mime_type = "image/jpeg"
     
-    # 讀取參考圖
+    # --- 3. 讀取參考圖 (Ref Image) ---
     if use_ref:
         img_col = col_map.get('Image_name')
         img_name = str(row[img_col] if img_col and img_col in row else '').strip()
@@ -346,7 +364,7 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
             return {"status": "Mock Success", "path": f"mock/{excel_filename}/{item_id}.png"}
 
         img_result_data = None
-        output_ext = ".png" # 預設值，萬一偵測失敗時用
+        output_ext = ".png" # 預設副檔名
         
         is_imagen = 'imagen' in model_name.lower()
         
@@ -356,16 +374,23 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
         if is_imagen:
             if image_bytes: return {"error": "Imagen model does not support Ref Image. Switch to Gemini."}
             
-            # 這裡我們還是請求 jpeg，但下方存檔時會再次確認
-            config_params = {'number_of_images': 1, 'aspect_ratio': ar_val, 'output_mime_type': "image/jpeg"}
+            # 🔥 [修正] 移除 person_generation，只保留基本參數
+            config_params = {
+                'number_of_images': 1, 
+                'aspect_ratio': ar_val,  # 傳遞 "16:9"
+                'output_mime_type': "image/jpeg"
+            }
             
             response = call_api_with_retry(
                 global_client.models.generate_images, 
-                model=model_name, prompt=final_prompt_text, config=config_params, retry_settings=retry_settings
+                model=model_name, 
+                prompt=final_prompt_text, 
+                config=config_params, 
+                retry_settings=retry_settings
             )
+            
             if response.generated_images: 
                 img_result_data = response.generated_images[0].image.image_bytes
-                # 雖然我們要求了 jpeg，但為了保險，這裡也可以留個預設值，或者直接用 .jpg
                 output_ext = ".jpg" 
             else: 
                 return {"error": "Imagen returned no images"}
@@ -376,12 +401,23 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
         else:
             parts = [types.Part.from_text(text=final_prompt_text)]
             if image_bytes: parts.append(types.Part.from_bytes(data=image_bytes, mime_type=input_mime_type))
-            gen_config = types.GenerateContentConfig(response_modalities=["IMAGE"])
+            
+            # Gemini 參數設定
+            gen_config = types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=ar_val 
+                )
+            )
             
             response = call_api_with_retry(
                 global_client.models.generate_content,
-                model=model_name, contents=[types.Content(role="user", parts=parts)], config=gen_config, retry_settings=retry_settings
+                model=model_name, 
+                contents=[types.Content(role="user", parts=parts)], 
+                config=gen_config, 
+                retry_settings=retry_settings
             )
+            
             if response.candidates:
                 for candidate in response.candidates:
                     if candidate.content and candidate.content.parts:
@@ -389,42 +425,41 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
                             if part.inline_data and part.inline_data.data:
                                 img_result_data = part.inline_data.data
                                 
-                                # 🔥 核心修改：使用 mimetypes 偵測 Gemini 回傳的真實格式
+                                # 偵測真實格式
                                 if part.inline_data.mime_type:
                                     guessed = mimetypes.guess_extension(part.inline_data.mime_type)
                                     if guessed:
                                         output_ext = guessed
-                                        if output_ext == ".jpe": output_ext = ".jpg" # 修正 Python 怪癖
+                                        if output_ext == ".jpe": output_ext = ".jpg"
                                 break
                     if img_result_data: break
+            
             if not img_result_data: return {"error": f"Gemini Refused: {response.text[:100] if response.text else 'No content'}"}
 
         # ==========================================
-        # 🏁 存檔 (通用邏輯)
+        # 🏁 存檔 (通用邏輯 - 含 Pin_Name)
         # ==========================================
         if img_result_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # [新邏輯] 1. 嘗試讀取 Pin_Name_For_Upload
+            # 1. 讀取 Pin_Name_For_Upload
             raw_pin_name = ""
             if 'Pin_Name' in col_map and col_map['Pin_Name'] in row:
                 raw_pin_name = str(row[col_map['Pin_Name']]).strip()
             
-            # [新邏輯] 2. 如果 Excel 那一格是空的，就用 ID 當作備案，避免檔名出錯
+            # 2. 備案：如果是空的，用 ID
             if not raw_pin_name:
                 raw_pin_name = str(item_id)
 
-            # [新邏輯] 3. 清理非法字元 (避免檔名包含 / \ : * ? " < > | )
+            # 3. 清理非法字元
             clean_pin_name = re.sub(r'[\\/*?:"<>|]', "", raw_pin_name)
             
-            # 建立資料夾
+            # 4. 建立資料夾
             excel_subfolder = os.path.join(OUTPUT_FOLDER, excel_filename)
             os.makedirs(excel_subfolder, exist_ok=True)
 
-            # [修改重點] ▼▼▼ 組合你要的檔名格式 ▼▼▼
-            # 格式: Pin_Name_For_Upload_{ratio}_{timestamp}.png
+            # 5. 組合檔名
             filename = f"{clean_pin_name}_{ratio_name}_{timestamp}{output_ext}"
-            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
             
             save_path = os.path.join(excel_subfolder, filename)
             
@@ -437,7 +472,7 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
 
     except Exception as e:
         return {"error": str(e)}
-          
+
 def select_config_file():
     """
     掃描當前目錄下所有以 'Config_Data' 開頭的 Excel 檔案。
@@ -535,7 +570,7 @@ def load_settings(config_path):
                 settings["model_name"] = str(sel.iloc[0].get('model_name', settings["model_name"])).strip()
                 log(f"✅ Loaded Image Model from Config: {settings['model_name']}")
             else:
-                log("⚠️ No valid 'Image' model selected in Config. Using default.")
+                log("⚠️ No valid 'Image' model selected in Config. Using default model: Gemini 2.5 Flash Image.")
         except Exception as e:
             log(f"⚠️ Error reading Model_Config: {e}")
 
