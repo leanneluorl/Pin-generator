@@ -19,6 +19,7 @@ from google.genai.errors import APIError
 from jinja2 import Template
 import multiprocessing
 import shutil 
+import mimetypes
 
 # 忽略 pandas 的 FutureWarning
 warnings.filterwarnings("ignore")
@@ -236,7 +237,7 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
                 return new_ratio
         
         print("   Invalid selection. Try again.")
-        
+
 # =======================================================
 # 🧩 核心處理邏輯 (Process Item)
 # =======================================================
