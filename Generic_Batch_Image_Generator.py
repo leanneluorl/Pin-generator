@@ -84,7 +84,8 @@ def load_template(path):
         return f.read()
 
 def normalize_cols(df):
-    df.columns = df.columns.str.strip().str.lower()
+    # 轉小寫、去空白、並將「空格」取代為「底線」
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
     return df
 
 # Self-Healing: Check for required files
@@ -153,38 +154,57 @@ def call_api_with_retry(api_func, *args, retry_settings=None, **kwargs):
 
 def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
     """
-    🔥 檢查當前模型是否支援選定的長寬比
+    🔥 檢查當前模型是否支援選定的長寬比 (已優化顯示格式：去除秒數與開頭0)
     """
+    # 內部小函式：用來清理格式 (例如 09:16:00 -> 9:16)
+    def clean_ratio_fmt(val):
+        s = str(val).strip()
+        if s.count(':') >= 2: # 去除秒數 (09:16:00 -> 09:16)
+            s = s.rsplit(':', 1)[0]
+        if s.startswith('0'): # 去除開頭 0 (09:16 -> 9:16)
+            s = s[1:]
+        return s
+
     if ratios_df.empty:
         return "1:1"
 
-    row = ratios_df[ratios_df['aspect_ratio'].astype(str).str.strip() == str(current_ratio).strip()]
+    # 1. 清理傳入的當前比例
+    clean_current = clean_ratio_fmt(current_ratio)
+
+    # 2. 找出 Excel 中對應的那一行 (需比對清理後的數值)
+    row = pd.DataFrame()
+    for _, r in ratios_df.iterrows():
+        if clean_ratio_fmt(r['aspect_ratio']) == clean_current:
+            row = r.to_frame().T
+            break
     
+    # 如果找不到對應設定，暫時回傳清理後的數值 (容錯)
     if row.empty:
-        return current_ratio
+        return clean_current
 
     supported_models_str = str(row.iloc[0].get('supported_models', 'All')).lower().strip()
     
+    # 3. 檢查相容性
     is_compatible = False
     model_lower = model_name.lower()
 
-    if 'all' in supported_models_str:
-        is_compatible = True
-    elif 'gemini' in supported_models_str and 'gemini' in model_lower:
-        is_compatible = True
-    elif 'imagen' in supported_models_str and 'imagen' in model_lower:
-        is_compatible = True
-    if 'gemini only' in supported_models_str and 'imagen' in model_lower:
-        is_compatible = False
+    if 'all' in supported_models_str: is_compatible = True
+    elif 'gemini' in supported_models_str and 'gemini' in model_lower: is_compatible = True
+    elif 'imagen' in supported_models_str and 'imagen' in model_lower: is_compatible = True
+    # 排除例外
+    if 'gemini only' in supported_models_str and 'imagen' in model_lower: is_compatible = False
     
     if is_compatible:
-        return current_ratio
+        return clean_current
 
-    print(f"\n⚠️  CONFLICT: Ratio '{current_ratio}' is marked as '{row.iloc[0]['supported_models']}',")
+    # 4. 衝突時顯示選單 (這裡套用清理邏輯)
+    print(f"\n⚠️  CONFLICT: Ratio '{clean_current}' is marked as '{row.iloc[0]['supported_models']}',")
     print(f"    but you selected model: '{model_name}'.")
     print("\n👉  Please select a compatible Aspect Ratio:")
 
     valid_options = []
+    seen = set() # 用來過濾重複 (例如 9:16 和 09:16:00 清理後是一樣的)
+
     for _, r_row in ratios_df.iterrows():
         s_str = str(r_row.get('supported_models', 'All')).lower()
         opt_compatible = False
@@ -193,7 +213,10 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
         elif 'imagen' in s_str and 'imagen' in model_lower: opt_compatible = True
         
         if opt_compatible:
-            valid_options.append(str(r_row['aspect_ratio']))
+            fmt_opt = clean_ratio_fmt(r_row['aspect_ratio'])
+            if fmt_opt not in seen:
+                valid_options.append(fmt_opt)
+                seen.add(fmt_opt)
 
     for i, opt in enumerate(valid_options):
         print(f"   [{i+1}] {opt}")
@@ -213,11 +236,12 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
                 return new_ratio
         
         print("   Invalid selection. Try again.")
-
+        
 # =======================================================
 # 🧩 核心處理邏輯 (Process Item)
 # =======================================================
-def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings):
+# 🔥 修改點 1: 在最後面新增 excel_filename 參數
+def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings, excel_filename):
     """
     雙引擎處理邏輯 + 顯示存檔路徑
     """
@@ -267,7 +291,7 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
                 return {"error": f"Invalid Image File: {e}"}
 
     try:
-        if use_mock:
+        if 'use_mock' in globals() and use_mock: # 這裡加個判斷防止報錯，如果沒有 global 變數
             time.sleep(0.1)
             return {"status": "Mock Success", "path": "mock.png"}
 
@@ -281,7 +305,6 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
             if image_bytes:
                 return {"error": "Imagen model does not support Ref Image in this script. Switch to Gemini."}
 
-            # 🔥 [修正] 移除 safety_settings (導致 Extra inputs not permitted 錯誤的原因)
             config_params = {
                 'number_of_images': 1,
                 'aspect_ratio': ar_val,
@@ -335,15 +358,21 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
                 return {"error": f"Gemini Refused: {err}"}
 
         # ==========================================
-        # 🏁 存檔
+        # 🏁 存檔 (這裡就是修改的重點)
         # ==========================================
         if img_result_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             clean_sheet = re.sub(r'[\\/*?:"<>|]', "", str(sheet_name))
             clean_id = re.sub(r'[\\/*?:"<>|]', "", str(item_id))
             
+            # 🔥 修改點 2: 建立子資料夾路徑 (OUTPUT_FOLDER / Excel檔名)
+            excel_subfolder = os.path.join(OUTPUT_FOLDER, excel_filename)
+            os.makedirs(excel_subfolder, exist_ok=True)
+
             filename = f"{clean_sheet}_{clean_id}_{ratio_name}_{timestamp}.png"
-            save_path = os.path.join(OUTPUT_FOLDER, filename)
+            
+            # 🔥 修改點 3: 存到子資料夾，而不是直接存到 OUTPUT_FOLDER
+            save_path = os.path.join(excel_subfolder, filename)
             
             with open(save_path, "wb") as f:
                 f.write(img_result_data)
@@ -354,7 +383,67 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
 
     except Exception as e:
         return {"error": str(e)}
+    
+def select_config_file():
+    """
+    掃描當前目錄下所有以 'Config_Data' 開頭的 Excel 檔案。
+    - 0 個: 回傳 None
+    - 1 個: 自動回傳路徑
+    - 多個: 讓使用者選擇
+    """
+    try:
+        current_dir = BASE_DIR
+        # 搜尋 Config_Data 開頭且是 Excel 的檔案，排除暫存檔(~$開頭)
+        config_files = [
+            f for f in os.listdir(current_dir) 
+            if f.lower().startswith("config_data") 
+            and f.lower().endswith((".xlsx", ".xls")) 
+            and not f.startswith("~$")
+        ]
+        config_files.sort()
 
+        # 情境 1: 沒找到檔案
+        if not config_files:
+            return None
+
+        # 情境 2: 只有一個檔案 -> 自動選取
+        if len(config_files) == 1:
+            selected_path = os.path.join(current_dir, config_files[0])
+            log(f"✅ Auto-detected Config File: {config_files[0]}")
+            return selected_path
+
+        # 情境 3: 多個檔案 -> 使用者選擇
+        print("\n" + "="*50)
+        print(f" 📂 [Select Configuration] Found {len(config_files)} files:")
+        print("="*50)
+        
+        for idx, file_name in enumerate(config_files):
+            # 如果是標準名稱，標記為 Default (選擇性顯示)
+            mark = " (Standard)" if file_name == "Config_Data.xlsx" else ""
+            print(f"  [{idx + 1}] {file_name}{mark}")
+            
+        print("="*50)
+
+        while True:
+            selection = input(f"👉 Enter number (1-{len(config_files)}) to select: ").strip()
+            
+            # 允許直接按 Enter 選第一個
+            if selection == "":
+                log(f"✅ Using first option: {config_files[0]}")
+                return os.path.join(current_dir, config_files[0])
+            
+            if selection.isdigit():
+                idx = int(selection) - 1
+                if 0 <= idx < len(config_files):
+                    selected_file = config_files[idx]
+                    log(f"✅ User selected Config: {selected_file}")
+                    return os.path.join(current_dir, selected_file)
+            print("⚠️ Invalid input. Please enter a valid number.")
+
+    except Exception as e:
+        log(f"❌ Error scanning config files: {e}")
+        return None
+    
 # =======================================================
 # ⚙️  設定與輔助函式
 # =======================================================
@@ -368,7 +457,8 @@ def load_settings(config_path):
         "aspect_ratio": "1:1", 
         "max_workers": 1,
         "retry_settings": {"max_retries": 3, "retry_backoff": 5}, # 預設值
-        "ratios_df": pd.DataFrame()
+        "ratios_df": pd.DataFrame(),
+        "models_df": pd.DataFrame()  # 🔥 新增：用來存放完整的模型設定表
     }
     
     if not os.path.exists(config_path): 
@@ -380,6 +470,7 @@ def load_settings(config_path):
         try:
             df = pd.read_excel(config_path, sheet_name='Model_Config')
             df = normalize_cols(df)
+            settings["models_df"] = df # 🔥 保存完整 DataFrame
             
             is_selected = df['selection'].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 'on'])
             is_image_type = df['model_type'].astype(str).str.strip().str.lower() == 'image'
@@ -442,41 +533,90 @@ def load_settings(config_path):
         log(f"⚠️ Error reading config: {e}")
     return settings
 
-def configure_runtime_settings(initial_model_name):
+def configure_runtime_settings(initial_model_name, models_df):
     print("\n" + "="*30 + "\n   🛠️  RUNTIME SETTINGS\n" + "="*30)
     
+    # 1. 設定測試模式
     t_in = input("👉 Run single test mode? (Y/N) [default: Y]: ").strip().upper()
     test_single = False if t_in == 'N' else True
     
+    # 2. 設定參考圖模式
     r_in = input("👉 Do you want to upload a reference image? (Y/N) [default: N]: ").strip().upper()
     use_ref = True if r_in == 'Y' else False
 
-    final_model = initial_model_name
+    # 3. 準備合法模型名單 (Candidate List)
+    valid_models = []
+    default_img2img_models = [
+        "gemini-3-pro-image-preview",
+        "gemini-2.5-flash-image",
+        "gemini-2.5-flash-image-preview"
+    ]
+
+    if not models_df.empty:
+        try:
+            if use_ref:
+                # 篩選 Image_To_Image == True 的模型
+                mask = models_df['image_to_image'].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 'on'])
+                valid_models = models_df[mask]['model_name'].tolist()
+            else:
+                # 一般模式：所有 Model_Type 為 'Image' 的都行
+                mask = models_df['model_type'].astype(str).str.lower() == 'image'
+                valid_models = models_df[mask]['model_name'].tolist()
+        except Exception as e:
+            log(f"⚠️ Error filtering models: {e}")
     
-    if use_ref:
-        name_lower = final_model.lower()
-        is_valid_img2img = ('gemini' in name_lower) and ('image' in name_lower)
-        if not is_valid_img2img:
-            print(f"⚠️  Model '{final_model}' does not support Image-to-Image.")
-            final_model = 'gemini-2.5-flash-image'
-            print(f"🔄  Forced switch to: {final_model}")
+    # Fallback: 如果清單為空，使用預設值
+    if not valid_models:
+        if use_ref:
+            valid_models = default_img2img_models
         else:
-            print(f"✅  Reference Image Mode ON. Using: {final_model}")
+            valid_models = default_img2img_models + ["imagen-4.0-generate-001"]
+
+    # 4. 檢查 Config 模型是否適用 (關鍵優化邏輯)
+    final_model = initial_model_name.strip()
+    is_compatible = final_model in valid_models
+
+    if is_compatible:
+        # ✅ 情境 A: 模型完美適用 -> 直接鎖定，不詢問
+        print("-" * 30)
+        print(f"✅ Using Configured Model: [{final_model}]")
+        print(f"   (Compatible with {'Ref Image' if use_ref else 'Text-to-Image'} mode)")
     else:
-        print(f"✅  Model selected: {final_model}")
+        # ⚠️ 情境 B: 模型不適用 或 未選取 -> 觸發選單
+        print("-" * 30)
+        if final_model:
+            print(f"⚠️  Configured model '{final_model}' is NOT compatible with {'Ref Image' if use_ref else 'Text-to-Image'} mode.")
+        
+        # 自動切換到第一個合法模型作為預設
+        final_model = valid_models[0]
+        print(f"🔄  Recommended: {final_model}")
+        print("👉  Please select a valid model:")
+        
+        for idx, m in enumerate(valid_models):
+            mark = " (Recommended)" if m == final_model else ""
+            print(f"   [{idx+1}] {m}{mark}")
+        
+        while True:
+            sel = input("👉 Enter number (or press Enter to use Recommended): ").strip()
+            if sel == "":
+                print(f"✅ Selected: {final_model}")
+                break 
+            
+            if sel.isdigit():
+                idx = int(sel) - 1
+                if 0 <= idx < len(valid_models):
+                    final_model = valid_models[idx]
+                    print(f"✅ Selected: {final_model}")
+                    break
+            print("⚠️ Invalid selection. Please enter a valid number.")
 
-    print("-" * 30)
-    print(f"Current Model: [{final_model}]")
-    change_model = input("👉 Do you want to change the model? (Enter new name or Press Enter to skip): ").strip()
-    if change_model:
-        final_model = change_model
-        print(f"✅ Model changed to: {final_model}")
-
+    # 5. 最終狀態顯示
     print("-" * 30)
     print(f"🤖 Final Model : {final_model}")
     print(f"🧪 Test Mode   : {'ON' if test_single else 'OFF'}")
     print(f"🖼️  Ref Image   : {'ON' if use_ref else 'OFF'}")
     print("-" * 30 + "\n")
+    
     return test_single, use_ref, final_model
 
 def find_actual_col_name(df_cols, key_alias):
@@ -515,12 +655,25 @@ if __name__ == '__main__':
 
         instruction_content = load_template(INSTRUCTION_FILE)
 
-        CONFIG_PATH = os.path.join(BASE_DIR, "Config_Data.xlsx")
-        log(f"⏳ Loading base settings from: {os.path.basename(CONFIG_PATH)}...")
-        settings = load_settings(CONFIG_PATH)
-        
-        test_single, use_ref_image, target_model = configure_runtime_settings(settings["model_name"])
+        # (新版優化)
+        target_config_path = select_config_file()
 
+        if target_config_path:
+            log(f"⏳ Loading settings from: {os.path.basename(target_config_path)}...")
+            settings = load_settings(target_config_path)
+        else:
+            # 沒找到檔案時的明顯提示
+            print("\n" + "!"*60)
+            log("⚠️  NO CONFIGURATION FILE FOUND (Config_Data*.xlsx)")
+            log("👉  System will run with [DEFAULT SETTINGS] (Gemini, 1:1, etc.)")
+            print("!"*60 + "\n")
+            # 傳入一個不存在的路徑，強制 load_settings 回傳預設值
+            settings = load_settings("DUMMY_PATH_FOR_DEFAULTS")
+        
+        test_single, use_ref_image, target_model = configure_runtime_settings(
+            settings["model_name"], 
+            settings["models_df"]
+        )
         validated_ratio = validate_aspect_ratio_support(target_model, settings["aspect_ratio"], settings["ratios_df"])
 
         default_folder = "Generated_Content"
@@ -546,6 +699,10 @@ if __name__ == '__main__':
 
         for file_name in all_files:
             file_path = os.path.join(target_folder_path, file_name)
+            
+            # 🔥 [修正點 1] 取得不含副檔名的檔名 (例如: Generated_Content_20251209)
+            excel_clean_name = os.path.splitext(file_name)[0]
+
             log(f"\n📦 Processing File: {file_name}")
             
             try:
@@ -582,8 +739,19 @@ if __name__ == '__main__':
                 for _, row in df.iterrows():
                     if not str(row[id_col]).strip() or not str(row[prompt_col]).strip(): continue
                     
-                    # 🔥 傳入 retry_settings
-                    jobs.append((row, validated_ratio, sheet, target_model, use_ref_image, instruction_content, col_map, settings["retry_settings"]))
+                    # 🔥 [修正點 2] 補上最後一個參數 excel_clean_name
+                    jobs.append((
+                        row, 
+                        validated_ratio, 
+                        sheet, 
+                        target_model, 
+                        use_ref_image, 
+                        instruction_content, 
+                        col_map, 
+                        settings["retry_settings"],
+                        excel_clean_name  # <--- 這裡必須加上
+                    ))
+                    
                     if test_single: break
                 
                 if not jobs:
@@ -592,7 +760,7 @@ if __name__ == '__main__':
 
                 log(f"     🔥 Starting {len(jobs)} tasks (Max Workers: {settings['max_workers']})...")
                 
-                # 🔥 使用 Config 讀取的 Max Workers
+                # 執行緒池 (這部分不用動，因為 jobs 已經修正了)
                 with ThreadPoolExecutor(max_workers=settings["max_workers"]) as executor:
                     futures = {executor.submit(process_single_item, *j): j for j in jobs}
                     for i, f in enumerate(as_completed(futures)):
@@ -605,10 +773,6 @@ if __name__ == '__main__':
                 if test_single: 
                     print("  🛑 Test mode: Stopping after first active sheet.")
                     break
-            
-            if test_single: 
-                print("\n🛑 Test mode: Stopping after first file.")
-                break
 
     except Exception as e:
         log(f"\n❌ Fatal Error: {e}")
