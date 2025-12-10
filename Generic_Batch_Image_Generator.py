@@ -36,6 +36,68 @@ def get_base_path():
 
 BASE_DIR = get_base_path()
 
+# =======================================================
+# 🛠️ [NEW] 自動釋放資源函式 (Self-Extracting Logic)
+# =======================================================
+def release_initial_files():
+    """
+    EXE 啟動時檢查：
+    如果外部沒有設定檔，就從 EXE 內部 (sys._MEIPASS) 複製出來。
+    """
+    def get_internal_path(filename):
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, filename)
+        else:
+            return os.path.join(BASE_DIR, filename)
+
+    # 🔥 更新：加入 image_generation_instruction.txt
+    assets_to_release = [
+        "Config_Data.xlsx", 
+        ".env",
+        "image_generation_instruction.txt"
+    ]
+
+    print("\n🔍 Checking for essential files...")
+    
+    # 取得目前目錄檔案列表 (用於 Config 判斷)
+    try:
+        current_files_in_dir = os.listdir(BASE_DIR)
+    except Exception:
+        current_files_in_dir = []
+
+    for filename in assets_to_release:
+        target_path = os.path.join(BASE_DIR, filename)
+        need_to_copy = True
+        
+        # 1. Config 檔特殊檢查：如果有任何 Config_Data*.xlsx 就不生成，避免覆蓋使用者的設定
+        if filename == "Config_Data.xlsx":
+            existing_configs = [
+                f for f in current_files_in_dir 
+                if f.lower().startswith("config_data") and f.lower().endswith(".xlsx")
+            ]
+            if existing_configs:
+                print(f"   ✅ Found existing config(s): {existing_configs}. Skipping default generation.")
+                need_to_copy = False
+        
+        # 2. 其他檔案 (如 .env, txt)：只要存在就跳過，不覆蓋
+        if os.path.exists(target_path):
+            need_to_copy = False
+
+        # 3. 執行釋放
+        if need_to_copy:
+            internal_source = get_internal_path(filename)
+            if os.path.exists(internal_source):
+                try:
+                    shutil.copy2(internal_source, target_path)
+                    print(f"   📦 Auto-generated missing file: {filename}")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to release {filename}: {e}")
+            else:
+                pass # 開發模式下可能無此內部資源
+
+# 🔥 程式啟動時立即執行檢查
+release_initial_files()
+
 # 設定 Log 資料夾與檔案
 LOG_FOLDER = os.path.join(BASE_DIR, "Logs")
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -111,7 +173,8 @@ def initialize_image_system():
 COL_ALIASES = {
     'ID': ['id', 'product_id'],
     'Prompt': ['prompt', 'image_prompt_for_ai'],
-    'Image_name': ['image_name', 'image_reference'] 
+    'Image_name': ['image_name', 'image_reference'],
+    'Pin_Name': ['pin_name_for_upload']  
 }
 
 def get_col_value(row, col_key):
@@ -341,14 +404,28 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
         # ==========================================
         if img_result_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            clean_sheet = re.sub(r'[\\/*?:"<>|]', "", str(sheet_name))
-            clean_id = re.sub(r'[\\/*?:"<>|]', "", str(item_id))
             
+            # [新邏輯] 1. 嘗試讀取 Pin_Name_For_Upload
+            raw_pin_name = ""
+            if 'Pin_Name' in col_map and col_map['Pin_Name'] in row:
+                raw_pin_name = str(row[col_map['Pin_Name']]).strip()
+            
+            # [新邏輯] 2. 如果 Excel 那一格是空的，就用 ID 當作備案，避免檔名出錯
+            if not raw_pin_name:
+                raw_pin_name = str(item_id)
+
+            # [新邏輯] 3. 清理非法字元 (避免檔名包含 / \ : * ? " < > | )
+            clean_pin_name = re.sub(r'[\\/*?:"<>|]', "", raw_pin_name)
+            
+            # 建立資料夾
             excel_subfolder = os.path.join(OUTPUT_FOLDER, excel_filename)
             os.makedirs(excel_subfolder, exist_ok=True)
 
-            # 檔名組合：使用上面偵測到的 output_ext
-            filename = f"{clean_sheet}_{clean_id}_{ratio_name}_{timestamp}{output_ext}"
+            # [修改重點] ▼▼▼ 組合你要的檔名格式 ▼▼▼
+            # 格式: Pin_Name_For_Upload_{ratio}_{timestamp}.png
+            filename = f"{clean_pin_name}_{ratio_name}_{timestamp}{output_ext}"
+            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+            
             save_path = os.path.join(excel_subfolder, filename)
             
             with open(save_path, "wb") as f:
@@ -702,7 +779,13 @@ if __name__ == '__main__':
                 prompt_col = find_actual_col_name(df.columns, 'Prompt')
                 if not id_col or not prompt_col: continue 
 
+                pin_col = find_actual_col_name(df.columns, 'Pin_Name') # 尋找 Pin_Name_For_Upload
+
                 col_map = {'ID': id_col, 'Prompt': prompt_col}
+
+                if pin_col:
+                    col_map['Pin_Name'] = pin_col
+
                 if use_ref_image:
                     img_col = find_actual_col_name(df.columns, 'Image_name')
                     if not img_col:

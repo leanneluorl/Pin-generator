@@ -239,8 +239,40 @@ if not os.path.isfile(PRODUCT_FILE):
     input("Press Enter to exit...")
     sys.exit(1)
 
+# =======================================================
+# 📂 [NEW] 圖片資料夾檢查與自動建立機制
+# =======================================================
 if not os.path.isdir(REF_IMAGE_FOLDER):
-    log(f"⚠️ Image folder not found: {REF_IMAGE_FOLDER}. Products without images will be skipped.")
+    print(f"\n[SYSTEM] ⚠️  Image folder 'ref_image' is missing.")
+    print(f"   [1] Enter the name of your existing image folder (e.g., 'my_photos')")
+    print(f"   [2] Create default 'ref_image' folder automatically")
+    
+    folder_choice = input("👉 Select option (1 or 2) [default=2]: ").strip()
+    
+    if folder_choice == '1':
+        # 選項 1: 使用者自訂資料夾
+        custom_name = input("👉 Enter your folder name: ").strip()
+        # 移除可能的引號
+        custom_name = custom_name.replace("'", "").replace('"', "")
+        custom_path = os.path.join(BASE_DIR, custom_name)
+        
+        if os.path.isdir(custom_path):
+            REF_IMAGE_FOLDER = custom_path
+            log(f"✅ Using custom image folder: {REF_IMAGE_FOLDER}")
+        else:
+            # 防呆: 如果自訂的也找不到，強制建立預設資料夾
+            log(f"❌ Folder '{custom_name}' not found. Automatically creating default 'ref_image'...")
+            os.makedirs(REF_IMAGE_FOLDER, exist_ok=True)
+            print(f"📁 Created: {REF_IMAGE_FOLDER}")
+            print(f"⚠️  Please put your product images in '{REF_IMAGE_FOLDER}' and run again if needed.")
+    else:
+        # 選項 2 (預設): 自動建立 ref_image
+        log(f"📁 Auto-creating missing folder: {REF_IMAGE_FOLDER}")
+        os.makedirs(REF_IMAGE_FOLDER, exist_ok=True)
+        print(f"⚠️  Folder created. Please put your product images in 'ref_image' before running.")
+else:
+    # 資料夾存在
+    log(f"✅ Image folder found: {REF_IMAGE_FOLDER}")
 
 # ------------------- Interactive settings -------------------
 log("\n--- Configuration Setup ---")
@@ -611,6 +643,19 @@ if __name__ == '__main__':
             if 'Pinterest_Angle' in df_products.columns:
                 df_products.rename(columns={'Pinterest_Angle':'Product_desc'}, inplace=True)
 
+            # ======================================================
+            # 🔥 [NEW] 建立圖片檔名對照表 (Case-Insensitive Map)
+            # ======================================================
+            # 讀取 ref_image 資料夾內所有檔案
+            try:
+                all_files_on_disk = os.listdir(REF_IMAGE_FOLDER)
+            except Exception:
+                all_files_on_disk = []
+
+            # 建立字典: { '小寫檔名': '真實檔名' }
+            # 例如: { 'bag.jpg': 'Bag.JPG', 'shoe.png': 'shoe.png' }
+            image_map = {f.lower(): f for f in all_files_on_disk if os.path.isfile(os.path.join(REF_IMAGE_FOLDER, f))}
+            
             job_list = []
             
             # 🔥 [防護] 本次 Sheet 的 Product ID 去重 (防止 Excel 裡有重複的 ID)
@@ -637,17 +682,26 @@ if __name__ == '__main__':
                     continue # 💥 發現錯誤 -> 跳過該產品所有 Style -> 確保只報錯一次
                 
                 # Check 2: 圖片檔案
-                img_name = str(product_row.get('Image_name', '')).strip()
-                img_path = os.path.join(REF_IMAGE_FOLDER, img_name)
+                raw_img_name = str(product_row.get('Image_name', '')).strip()
                 
-                if not os.path.isfile(img_path):
+                # 1. 轉成小寫去查表
+                actual_filename = image_map.get(raw_img_name.lower())
+                
+                if actual_filename:
+                    # ✅ 找到了！使用硬碟上的真實檔名 (修正 Excel 大小寫誤差)
+                    img_path = os.path.join(REF_IMAGE_FOLDER, actual_filename)
+                    
+                    # 🔥 [重要] 把修正後的檔名寫回 row，讓後續 API 呼叫不出錯
+                    product_row['Image_name'] = actual_filename 
+                else:
+                    # ❌ 真的找不到
                     input_error_list.append({
                         'Source_Product_Sheet': target_sheet, 
                         'Product_ID': product_id, 
                         'Excel_Row_Index': excel_row_num, 
-                        'Error_Message': f"Missing Image File. Excel value: '{img_name}' vs Disk Check: Not Found."
+                        'Error_Message': f"Missing Image File. Excel value: '{raw_img_name}' (Checked case-insensitive) vs Disk: Not Found."
                     })
-                    continue # 💥 發現錯誤 -> 跳過該產品所有 Style -> 確保只報錯一次
+                    continue # 💥 發現錯誤 -> 跳過
 
                 # ✅ Product 驗證通過，才開始生成任務
                 for style_id, style_row in df_style.iterrows():
