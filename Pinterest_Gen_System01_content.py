@@ -78,6 +78,70 @@ def get_base_path():
 
 BASE_DIR = get_base_path()
 
+# =======================================================
+# 🛠️ [新增功能] 自動釋放打包資源
+# =======================================================
+def get_internal_path(filename):
+    """取得打包在 EXE 內部的資源路徑"""
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller 打包後的內部暫存路徑
+        return os.path.join(sys._MEIPASS, filename)
+    else:
+        # 開發模式下，直接抓腳本旁邊的檔案
+        return os.path.join(BASE_DIR, filename)
+
+def release_initial_files():
+    """如果外部檔案不存在，則從 EXE 內部釋放出來"""
+    
+    # 🔥 修正：加入 ".env" 到釋放清單
+    assets_to_release = [
+        "Config_Data.xlsx",                  
+        "Pinterest_Affiliate_Product.xlsx",  
+        "image_prompt_template.txt",
+        "content_prompt_template.txt",
+        ".env" 
+    ]
+
+    log("🔍 Checking for essential files...")
+    
+    # 取得目前目錄檔案列表 (用於 Config 判斷)
+    try:
+        current_files_in_dir = os.listdir(BASE_DIR)
+    except Exception as e:
+        log(f"⚠️ Error reading directory: {e}")
+        current_files_in_dir = []
+
+    for filename in assets_to_release:
+        target_path = os.path.join(BASE_DIR, filename)
+        need_to_copy = True
+        
+        # 1. Config 檔特殊檢查：如果有任何 Config_Data*.xlsx 就不生成
+        if filename == "Config_Data.xlsx":
+            existing_configs = [
+                f for f in current_files_in_dir 
+                if f.lower().startswith("config_data") and f.lower().endswith(".xlsx")
+            ]
+            if existing_configs:
+                log(f"   ✅ Found existing config(s): {existing_configs}. Skipping default generation.")
+                need_to_copy = False
+        
+        # 2. 標準檢查：如果檔案已存在 (例如 .env 已經有 Key 了)，絕對不覆蓋
+        if os.path.exists(target_path):
+            need_to_copy = False
+
+        # 3. 執行釋放
+        if need_to_copy:
+            internal_source = get_internal_path(filename)
+            if os.path.exists(internal_source):
+                try:
+                    shutil.copy2(internal_source, target_path)
+                    log(f"📦 Auto-generated missing file: {filename}")
+                except Exception as e:
+                    log(f"⚠️ Failed to release {filename}: {e}")
+            else:
+                # 只有開發模式下可能會找不到內部資源
+                pass
+
 # 設定 Log 資料夾與檔案
 LOG_FOLDER = os.path.join(BASE_DIR, "Logs")
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -104,6 +168,8 @@ log(f"🚀 Pinterest Content Generator (Optimized Batch Mode)")
 log(f"📂 Working Directory: {BASE_DIR}")
 log(f"📝 Log file: {LOG_FILE_PATH}")
 print("-" * 50)
+
+release_initial_files()
 
 # 設定其他檔案路徑
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")

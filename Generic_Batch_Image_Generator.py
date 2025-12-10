@@ -244,7 +244,7 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
 # 🔥 修改點 1: 在最後面新增 excel_filename 參數
 def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings, excel_filename):
     """
-    雙引擎處理邏輯 + 顯示存檔路徑
+    雙引擎處理邏輯 + 顯示存檔路徑 (最終版：自動建立資料夾 + 自動偵測副檔名)
     """
     try:
         item_id = str(row[col_map['ID']] if col_map['ID'] in row else 'Unknown').strip()
@@ -252,127 +252,103 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
     except:
         return {"error": "Column read error"}
     
-    # 處理 Aspect Ratio 字串 (例如 09:16:00 -> 9:16)
+    # 處理 Aspect Ratio
     ar_val = str(target_ratio if target_ratio else '1:1').strip()
-    
-    # 嘗試清理不標準的 AR (例如包含秒數的 09:16:00)
-    if ar_val.count(':') == 2:
-        ar_val = ar_val.rsplit(':', 1)[0] # 去掉最後一個 :00
-    if ar_val.startswith('0'):
-        ar_val = ar_val[1:] # 去掉開頭的 0 (如 09:16 -> 9:16)
-        
+    if ar_val.count(':') == 2: ar_val = ar_val.rsplit(':', 1)[0]
+    if ar_val.startswith('0'): ar_val = ar_val[1:]
     ratio_name = ar_val.replace(':', 'x')
     
     final_prompt_text = f"{instruction}\n\nAspect Ratio: {ar_val}\nPrompt: {prompt_text}"
 
     image_bytes = None
-    mime_type = "image/jpeg"
+    input_mime_type = "image/jpeg"
     
+    # 讀取參考圖
     if use_ref:
         img_col = col_map.get('Image_name')
         img_name = str(row[img_col] if img_col and img_col in row else '').strip()
-        
         if img_name:
-            possible_paths = [
-                os.path.join(BASE_DIR, "ref_image", img_name),
-                os.path.join(BASE_DIR, img_name)
-            ]
+            possible_paths = [os.path.join(BASE_DIR, "ref_image", img_name), os.path.join(BASE_DIR, img_name)]
             found_img_path = next((p for p in possible_paths if os.path.exists(p)), None)
-            
-            if not found_img_path:
-                return {"error": f"Ref Image Not Found: {img_name}"}
-            
+            if not found_img_path: return {"error": f"Ref Image Not Found: {img_name}"}
             try:
-                if found_img_path.lower().endswith(".png"): mime_type = "image/png"
-                elif found_img_path.lower().endswith(".webp"): mime_type = "image/webp"
-                
-                with open(found_img_path, "rb") as image_file:
-                    image_bytes = image_file.read()
-            except Exception as e:
-                return {"error": f"Invalid Image File: {e}"}
+                if found_img_path.lower().endswith(".png"): input_mime_type = "image/png"
+                elif found_img_path.lower().endswith(".webp"): input_mime_type = "image/webp"
+                with open(found_img_path, "rb") as image_file: image_bytes = image_file.read()
+            except Exception as e: return {"error": f"Invalid Image File: {e}"}
 
     try:
-        if 'use_mock' in globals() and use_mock: # 這裡加個判斷防止報錯，如果沒有 global 變數
+        if 'use_mock' in globals() and use_mock:
             time.sleep(0.1)
-            return {"status": "Mock Success", "path": "mock.png"}
+            return {"status": "Mock Success", "path": f"mock/{excel_filename}/{item_id}.png"}
 
         img_result_data = None
+        output_ext = ".png" # 預設值，萬一偵測失敗時用
+        
         is_imagen = 'imagen' in model_name.lower()
         
         # ==========================================
         # 🅰️ 路線 A: Imagen (Generate Images)
         # ==========================================
         if is_imagen:
-            if image_bytes:
-                return {"error": "Imagen model does not support Ref Image in this script. Switch to Gemini."}
-
-            config_params = {
-                'number_of_images': 1,
-                'aspect_ratio': ar_val,
-                'output_mime_type': "image/jpeg"
-            }
+            if image_bytes: return {"error": "Imagen model does not support Ref Image. Switch to Gemini."}
+            
+            # 這裡我們還是請求 jpeg，但下方存檔時會再次確認
+            config_params = {'number_of_images': 1, 'aspect_ratio': ar_val, 'output_mime_type': "image/jpeg"}
             
             response = call_api_with_retry(
                 global_client.models.generate_images, 
-                model=model_name, 
-                prompt=final_prompt_text, 
-                config=config_params,
-                retry_settings=retry_settings
+                model=model_name, prompt=final_prompt_text, config=config_params, retry_settings=retry_settings
             )
-            
-            if response.generated_images:
+            if response.generated_images: 
                 img_result_data = response.generated_images[0].image.image_bytes
-            else:
+                # 雖然我們要求了 jpeg，但為了保險，這裡也可以留個預設值，或者直接用 .jpg
+                output_ext = ".jpg" 
+            else: 
                 return {"error": "Imagen returned no images"}
-
+        
         # ==========================================
         # 🅱️ 路線 B: Gemini (Generate Content)
         # ==========================================
         else:
             parts = [types.Part.from_text(text=final_prompt_text)]
-            if image_bytes:
-                parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-
-            gen_config = types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-            )
-
+            if image_bytes: parts.append(types.Part.from_bytes(data=image_bytes, mime_type=input_mime_type))
+            gen_config = types.GenerateContentConfig(response_modalities=["IMAGE"])
+            
             response = call_api_with_retry(
                 global_client.models.generate_content,
-                model=model_name,
-                contents=[types.Content(role="user", parts=parts)],
-                config=gen_config,
-                retry_settings=retry_settings
+                model=model_name, contents=[types.Content(role="user", parts=parts)], config=gen_config, retry_settings=retry_settings
             )
-
             if response.candidates:
                 for candidate in response.candidates:
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
                             if part.inline_data and part.inline_data.data:
                                 img_result_data = part.inline_data.data
+                                
+                                # 🔥 核心修改：使用 mimetypes 偵測 Gemini 回傳的真實格式
+                                if part.inline_data.mime_type:
+                                    guessed = mimetypes.guess_extension(part.inline_data.mime_type)
+                                    if guessed:
+                                        output_ext = guessed
+                                        if output_ext == ".jpe": output_ext = ".jpg" # 修正 Python 怪癖
                                 break
                     if img_result_data: break
-            
-            if not img_result_data:
-                err = response.text[:100] if response.text else "No content"
-                return {"error": f"Gemini Refused: {err}"}
+            if not img_result_data: return {"error": f"Gemini Refused: {response.text[:100] if response.text else 'No content'}"}
 
         # ==========================================
-        # 🏁 存檔 (這裡就是修改的重點)
+        # 🏁 存檔 (通用邏輯)
         # ==========================================
         if img_result_data:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             clean_sheet = re.sub(r'[\\/*?:"<>|]', "", str(sheet_name))
             clean_id = re.sub(r'[\\/*?:"<>|]', "", str(item_id))
             
-            # 🔥 修改點 2: 建立子資料夾路徑 (OUTPUT_FOLDER / Excel檔名)
             excel_subfolder = os.path.join(OUTPUT_FOLDER, excel_filename)
             os.makedirs(excel_subfolder, exist_ok=True)
 
-            filename = f"{clean_sheet}_{clean_id}_{ratio_name}_{timestamp}.png"
-            
-            # 🔥 修改點 3: 存到子資料夾，而不是直接存到 OUTPUT_FOLDER
+            # 檔名組合：使用上面偵測到的 output_ext
+            filename = f"{clean_sheet}_{clean_id}_{ratio_name}_{timestamp}{output_ext}"
             save_path = os.path.join(excel_subfolder, filename)
             
             with open(save_path, "wb") as f:
@@ -384,7 +360,7 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
 
     except Exception as e:
         return {"error": str(e)}
-    
+          
 def select_config_file():
     """
     掃描當前目錄下所有以 'Config_Data' 開頭的 Excel 檔案。
