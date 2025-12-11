@@ -95,8 +95,55 @@ def release_initial_files():
             else:
                 pass # 開發模式下可能無此內部資源
 
-# 🔥 程式啟動時立即執行檢查
+# =======================================================
+# 🛠️ 2. Demo 檔案生成 (安全檢查，絕不覆蓋)
+# =======================================================
+def ensure_demo_file_exists():
+    """
+    檢查 Generated_Content 資料夾內是否有 Demo 檔案。
+    若無 -> 生成。
+    若有 -> 跳過 (保護使用者檔案)。
+    """
+    # 預設 Demo 資料夾與檔名
+    default_folder = os.path.join(BASE_DIR, "Generated_Content")
+    demo_filename = "Demo_Input_For_Image_Gen.xlsx"
+    target_path = os.path.join(default_folder, demo_filename)
+
+    # 1. 確保資料夾存在
+    if not os.path.exists(default_folder):
+        try:
+            os.makedirs(default_folder, exist_ok=True)
+            print(f"   📁 Created folder: Generated_Content")
+        except Exception as e:
+            print(f"   ❌ Error creating folder: {e}")
+            return
+
+    # 2. 🔥 關鍵檢查：如果檔案已存在，絕對不覆蓋，直接結束函式
+    if os.path.exists(target_path):
+        # 這裡不特別 print，以免干擾 Log，保持安靜
+        return 
+
+    # 3. 只有檔案不存在時，才生成 Demo
+    print(f"   🎁 Generating Demo Input File: {demo_filename}")
+    try:
+        demo_data = {
+            "ID": ["demo_01", "demo_02"],
+            "Prompt": [
+                "A futuristic city with neon lights, cyberpunk style, 8k, realistic", 
+                "A cozy wooden cabin in a snowy forest, warm lighting, cinematic"
+            ],
+            "Image_name": ["", ""] # 預設留空
+        }
+        df = pd.DataFrame(demo_data)
+        with pd.ExcelWriter(target_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+        print(f"      ✅ Demo file created successfully.")
+    except Exception as e:
+        print(f"      ❌ Failed to create demo file: {e}")
+
+# 🔥 程式啟動時，依序執行檢查
 release_initial_files()
+ensure_demo_file_exists() # <--- 這裡加入 Demo 檢查
 
 # 設定 Log 資料夾與檔案
 LOG_FOLDER = os.path.join(BASE_DIR, "Logs")
@@ -304,19 +351,9 @@ def validate_aspect_ratio_support(model_name, current_ratio, ratios_df):
 # =======================================================
 # 🧩 核心處理邏輯 (Process Item)
 # =======================================================
-# 🔥 修改點 1: 在最後面新增 excel_filename 參數
-# =======================================================
-# 🧩 核心處理邏輯 (Process Item) - API 參數優化版
-# =======================================================
-# =======================================================
-# 🧩 核心處理邏輯 (Process Item) - 修正 Imagen 參數版
-# =======================================================
 def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, instruction, col_map, retry_settings, excel_filename):
     """
     雙引擎處理邏輯 (Gemini & Imagen)
-    - 修正：移除 Imagen 不支援的 person_generation 參數
-    - 保留：API 參數傳遞 Aspect Ratio
-    - 保留：Pin_Name_For_Upload 檔名邏輯
     """
     try:
         item_id = str(row[col_map['ID']] if col_map['ID'] in row else 'Unknown').strip()
@@ -349,6 +386,7 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
         img_col = col_map.get('Image_name')
         img_name = str(row[img_col] if img_col and img_col in row else '').strip()
         if img_name:
+            # 支援 ref_image 資料夾或根目錄
             possible_paths = [os.path.join(BASE_DIR, "ref_image", img_name), os.path.join(BASE_DIR, img_name)]
             found_img_path = next((p for p in possible_paths if os.path.exists(p)), None)
             if not found_img_path: return {"error": f"Ref Image Not Found: {img_name}"}
@@ -476,9 +514,6 @@ def process_single_item(row, target_ratio, sheet_name, model_name, use_ref, inst
 def select_config_file():
     """
     掃描當前目錄下所有以 'Config_Data' 開頭的 Excel 檔案。
-    - 0 個: 回傳 None
-    - 1 個: 自動回傳路徑
-    - 多個: 讓使用者選擇
     """
     try:
         current_dir = BASE_DIR
@@ -539,7 +574,6 @@ def select_config_file():
 def load_settings(config_path):
     """
     讀取 Config_Data.xlsx
-    🔥 修正：完整讀取 Concurrency_Config 並打包成 retry_settings
     """
     settings = { 
         "model_name": "gemini-2.5-flash-image", 
@@ -744,19 +778,16 @@ if __name__ == '__main__':
 
         instruction_content = load_template(INSTRUCTION_FILE)
 
-        # (新版優化)
         target_config_path = select_config_file()
 
         if target_config_path:
             log(f"⏳ Loading settings from: {os.path.basename(target_config_path)}...")
             settings = load_settings(target_config_path)
         else:
-            # 沒找到檔案時的明顯提示
             print("\n" + "!"*60)
             log("⚠️  NO CONFIGURATION FILE FOUND (Config_Data*.xlsx)")
             log("👉  System will run with [DEFAULT SETTINGS] (Gemini, 1:1, etc.)")
             print("!"*60 + "\n")
-            # 傳入一個不存在的路徑，強制 load_settings 回傳預設值
             settings = load_settings("DUMMY_PATH_FOR_DEFAULTS")
         
         test_single, use_ref_image, target_model = configure_runtime_settings(
@@ -789,7 +820,9 @@ if __name__ == '__main__':
         for file_name in all_files:
             file_path = os.path.join(target_folder_path, file_name)
             
-            # 🔥 [修正點 1] 取得不含副檔名的檔名 (例如: Generated_Content_20251209)
+            # 🔥 [CRITICAL FIX] 初始化變數 (避免 NameError)
+            executed_any_job_in_this_file = False 
+            
             excel_clean_name = os.path.splitext(file_name)[0]
 
             log(f"\n📦 Processing File: {file_name}")
@@ -814,7 +847,7 @@ if __name__ == '__main__':
                 prompt_col = find_actual_col_name(df.columns, 'Prompt')
                 if not id_col or not prompt_col: continue 
 
-                pin_col = find_actual_col_name(df.columns, 'Pin_Name') # 尋找 Pin_Name_For_Upload
+                pin_col = find_actual_col_name(df.columns, 'Pin_Name') 
 
                 col_map = {'ID': id_col, 'Prompt': prompt_col}
 
@@ -834,7 +867,6 @@ if __name__ == '__main__':
                 for _, row in df.iterrows():
                     if not str(row[id_col]).strip() or not str(row[prompt_col]).strip(): continue
                     
-                    # 🔥 [修正點 2] 補上最後一個參數 excel_clean_name
                     jobs.append((
                         row, 
                         validated_ratio, 
@@ -844,7 +876,7 @@ if __name__ == '__main__':
                         instruction_content, 
                         col_map, 
                         settings["retry_settings"],
-                        excel_clean_name  # <--- 這裡必須加上
+                        excel_clean_name 
                     ))
                     
                     if test_single: break
@@ -852,10 +884,12 @@ if __name__ == '__main__':
                 if not jobs:
                     log("     ℹ️  No valid jobs.")
                     continue
+                
+                # 🔥 [CRITICAL FIX] 標記：確認有任務要執行
+                executed_any_job_in_this_file = True
 
                 log(f"     🔥 Starting {len(jobs)} tasks (Max Workers: {settings['max_workers']})...")
                 
-                # 執行緒池 (這部分不用動，因為 jobs 已經修正了)
                 with ThreadPoolExecutor(max_workers=settings["max_workers"]) as executor:
                     futures = {executor.submit(process_single_item, *j): j for j in jobs}
                     for i, f in enumerate(as_completed(futures)):
@@ -867,7 +901,14 @@ if __name__ == '__main__':
 
                 if test_single: 
                     print("  🛑 Test mode: Stopping after first active sheet.")
-                    break
+                    break # 跳出 Sheet 迴圈
+
+            # =======================================================
+            # 🔥 [CRITICAL FIX] 檢查變數狀態，跳出最外層 File 迴圈
+            # =======================================================
+            if test_single and executed_any_job_in_this_file:
+                print("🛑 Test mode: Job done. Exiting file loop.")
+                break
 
     except Exception as e:
         log(f"\n❌ Fatal Error: {e}")
