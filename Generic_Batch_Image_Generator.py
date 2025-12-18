@@ -123,28 +123,35 @@ def ensure_demo_file_exists():
             print(f"   ❌ Error creating folder: {e}")
             return
 
+        print(f"   🎁 Extracting Demo Input File: {demo_filename}")
+
+        # 4. 尋找來源檔案 (支援 EXE 內部路徑 與 開發環境路徑)
+        source_path = None
+
+        if hasattr(sys, "_MEIPASS"):
+            # [打包後] 位於 EXE 內部的暫存資料夾
+            source_path = os.path.join(sys._MEIPASS, demo_filename)
+        else:
+            # [開發模式] 位於專案的 sample_files 資料夾
+            # 假設您的結構是 sample_files/Demo_Input_For_Image_Gen.xlsx
+            source_path = os.path.join(BASE_DIR, "sample_files", demo_filename)
+
+        # 5. 執行複製
+        if source_path and os.path.exists(source_path):
+            try:
+                shutil.copy2(source_path, target_path)
+                print(f"      ✅ Demo file extracted successfully.")
+            except Exception as e:
+                print(f"      ❌ Failed to extract demo file: {e}")
+        else:
+            # 萬一連來源都找不到 (例如開發環境路徑指錯)
+            print(f"      ⚠️ Warning: Source demo file not found at {source_path}")
+            # 這裡可以保留舊的 pd.DataFrame 邏輯當作最後備案，或直接報錯
+
     # 2. 🔥 關鍵檢查：如果檔案已存在，絕對不覆蓋，直接結束函式
     if os.path.exists(target_path):
         # 這裡不特別 print，以免干擾 Log，保持安靜
         return
-
-    # 3. 只有檔案不存在時，才生成 Demo
-    print(f"   🎁 Generating Demo Input File: {demo_filename}")
-    try:
-        demo_data = {
-            "ID": ["demo_01", "demo_02"],
-            "Prompt": [
-                "A futuristic city with neon lights, cyberpunk style, 8k, realistic",
-                "A cozy wooden cabin in a snowy forest, warm lighting, cinematic",
-            ],
-            "Image_name": ["", ""],  # 預設留空
-        }
-        df = pd.DataFrame(demo_data)
-        with pd.ExcelWriter(target_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False)
-        print(f"      ✅ Demo file created successfully.")
-    except Exception as e:
-        print(f"      ❌ Failed to create demo file: {e}")
 
 
 # 🔥 程式啟動時，依序執行檢查

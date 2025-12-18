@@ -2,6 +2,7 @@ import PyInstaller.__main__
 import shutil
 import os
 import sys
+from datetime import datetime
 
 # =======================================================
 # ⚙️ 設定區域 (Configuration)
@@ -21,13 +22,25 @@ SCRIPT_CONFIG = {
                 "image_generation_instruction.txt",
             ),
             ("generate_env", None, ".env"),
+            (
+                "sample",
+                "Demo_Input_For_Image_Gen.xlsx",
+                "Demo_Input_For_Image_Gen.xlsx",
+            ),
         ],
         "folders": [],
         # 🔥 修正點 1: 確保建立 "Generated_Content" 資料夾
         "create_dirs": ["Generated_Images", "Logs", "ref_image", "Generated_Content"],
         # 🔥 修正點 2: 新增複製 Demo 檔案的設定
         # 格式: ("來源檔名(在sample_files內)", "目標資料夾", "目標檔名")
-        "copy_files": [("Generated_Content", "Demo_Input_For_Image_Gen.xlsx")],
+        # 格式: ("來源檔名", "目標資料夾", "目標檔名")
+        "copy_files": [
+            (
+                "Demo_Input_For_Image_Gen.xlsx",
+                "Generated_Content",
+                "Demo_Input_For_Image_Gen.xlsx",
+            )
+        ],
     },
     # 🔵 2. Content Generator (Pinterest_Gen_System01_content.py)
     "content": {
