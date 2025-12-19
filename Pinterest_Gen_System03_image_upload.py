@@ -104,12 +104,50 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def get_existing_file_link(service, filename, folder_id):
+    """
+    [New Function] Checks if a file with the same name exists in the folder.
+    Returns the direct link if found, None otherwise.
+    """
+    try:
+        # Search query: name matches, inside specific folder, not in trash
+        query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+        results = (
+            service.files().list(q=query, fields="files(id, webViewLink)").execute()
+        )
+        files = results.get("files", [])
+
+        if files:
+            # File exists
+            file_id = files[0]["id"]
+            print(f"   ↪️ Found existing file on Drive: {filename}")
+            # Ensure it's public just in case (optional, but safer)
+            try:
+                service.permissions().create(
+                    fileId=file_id, body={"type": "anyone", "role": "reader"}
+                ).execute()
+            except:
+                pass  # Ignore if already public or permission error
+            return f"https://drive.google.com/uc?id={file_id}"
+
+    except Exception as e:
+        print(f"   ⚠️ Warning: Check existing file failed ({e})")
+
+    return None
+
+
 def upload_to_drive(service, file_path, filename, folder_id):
+    # [Modification] Step 1: Check if file already exists
+    existing_link = get_existing_file_link(service, filename, folder_id)
+    if existing_link:
+        return existing_link
+
+    # [Modification] Step 2: If not exists, proceed to upload
     for attempt in range(3):
         try:
             media = MediaFileUpload(file_path, resumable=True)
             file_metadata = {"name": filename, "parents": [folder_id]}
-            print(f"📤 Uploading ({attempt+1}/3): {filename}...")
+            print(f"   📤 Uploading ({attempt+1}/3): {filename}...")
             file = (
                 service.files()
                 .create(body=file_metadata, media_body=media, fields="id")
@@ -121,7 +159,7 @@ def upload_to_drive(service, file_path, filename, folder_id):
             ).execute()
             return f"https://drive.google.com/uc?id={file['id']}"
         except Exception as e:
-            print(f"⚠ Attempt {attempt+1} failed: {e}")
+            print(f"   ⚠ Attempt {attempt+1} failed: {e}")
             if attempt < 2:
                 time.sleep(2)
     return None
@@ -221,7 +259,7 @@ def main():
 
     print(f"\n🚀 Processing: {selected_excel}...")
 
-    # [Modification 1] Loop through all sheets
+    # Loop through all sheets
     for sheet_name in xls.sheet_names:
         print(f"   📄 Reading Sheet: {sheet_name}...")
         df = pd.read_excel(excel_path, sheet_name=sheet_name).fillna("")
@@ -252,13 +290,14 @@ def main():
             if not actual_img:
                 row_errors.append(f"Image starting with '{img_prefix}' not found")
 
+            # Handle Style ID
+            sid = 0
             try:
-                # Handle Style ID (convert float to int string properly)
                 raw_sid = row.get("Applied_Style_ID", 0)
                 if isinstance(raw_sid, float):
                     sid = int(raw_sid)
                 else:
-                    sid = int(float(str(raw_sid)))  # Handle string '1.0'
+                    sid = int(float(str(raw_sid)))
 
                 board = mapping.get(sid)
                 if not board:
@@ -268,28 +307,28 @@ def main():
 
             if row_errors:
                 err_data = row.to_dict()
-                err_data["Sheet"] = sheet_name  # Add sheet info to error log
+                err_data["Sheet"] = sheet_name
                 err_data["Failure_Reason"] = "; ".join(row_errors)
                 error_log.append(err_data)
             else:
                 img_full_path = os.path.join(image_dir, actual_img)
                 url = upload_to_drive(service, img_full_path, actual_img, drive_id)
                 if url:
-                    # [Modification 3] Fixed CSV format (Added Thumbnail, changed Date format)
-                    final_rows.append(
-                        {
-                            "Title": str(row.get("Pin_Title")).strip(),
-                            "Media URL": url,
-                            "Pinterest board": board,
-                            "Thumbnail": "",  # Required by Pinterest Bulk Upload
-                            "Description": str(row.get("Pin_Description")).strip(),
-                            "Link": str(row.get("Affiliate_Link")).strip(),
-                            "Publish date": start_dt.strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            ),  # Pinterest format
-                            "Keywords": str(row.get("Pin_Keywords")).strip(),
-                        }
-                    )
+                    # [Modification] Store extra data for grouping (starts with underscore to identify internal use)
+                    row_data = {
+                        "Title": str(row.get("Pin_Title")).strip(),
+                        "Media URL": url,
+                        "Pinterest board": board,
+                        "Thumbnail": "",
+                        "Description": str(row.get("Pin_Description")).strip(),
+                        "Link": str(row.get("Affiliate_Link")).strip(),
+                        "Publish date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "Keywords": str(row.get("Pin_Keywords")).strip(),
+                        # Internal fields for splitting files
+                        "_StyleID": sid,
+                        "_StyleName": str(row.get("Style_Name", "Style")).strip(),
+                    }
+                    final_rows.append(row_data)
                     start_dt += timedelta(minutes=interval)
                 else:
                     err_data = row.to_dict()
@@ -307,9 +346,7 @@ def main():
             break
 
     # Final Exports
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )  # [Modification 2] Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if error_log:
         pd.DataFrame(error_log).to_excel(
@@ -331,14 +368,19 @@ def main():
 
     if final_rows:
         df_out = pd.DataFrame(final_rows)
-        for b_name, group in df_out.groupby("Pinterest board"):
-            safe_b = "".join(x for x in b_name if x.isalnum() or x in " _").replace(
+
+        # [Modification] Group by _StyleID (and _StyleName for filename) instead of Board
+        # Using a composite key for grouping
+        group_keys = ["_StyleID", "_StyleName"]
+
+        for (sid, sname), group in df_out.groupby(group_keys):
+            # Safe filename
+            safe_sname = "".join(x for x in sname if x.isalnum() or x in " _").replace(
                 " ", "_"
             )
-            # [Modification 2] Add timestamp to filename
-            output_filename = f"upload_{timestamp}_{safe_b}.csv"
+            output_filename = f"upload_{timestamp}_Style_{sid}_{safe_sname}.csv"
 
-            # [Modification 3] Ensure correct column order
+            # Clean up: Remove internal helper columns and keep only standard Pinterest columns
             group = group.reindex(columns=csv_columns, fill_value="")
 
             group.to_csv(
@@ -346,7 +388,7 @@ def main():
                 index=False,
                 encoding="utf-8-sig",
             )
-            print(f"✅ Saved: {output_filename}")
+            print(f"✅ Saved CSV for Style {sid} ({sname}): {output_filename}")
 
     print(f"\n🎉 Finished. Check: {output_dir}")
 
