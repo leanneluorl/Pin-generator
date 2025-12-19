@@ -115,7 +115,7 @@ def upload_to_drive(service, file_path, filename, folder_id):
                 .create(body=file_metadata, media_body=media, fields="id")
                 .execute()
             )
-            # 設定權限為公開讀取 (reader)，確保 Media URL 可被存取
+            # Ensure file is public so Pinterest can read it
             service.permissions().create(
                 fileId=file["id"], body={"type": "anyone", "role": "reader"}
             ).execute()
@@ -136,7 +136,11 @@ def main():
     # Step 1: Locate Excel Root
     excel_root = get_valid_folder(DEFAULT_EXCEL_ROOT, "Excel Input (Generated_Content)")
 
-    excel_files = [f for f in os.listdir(excel_root) if f.endswith(".xlsx")]
+    excel_files = [
+        f
+        for f in os.listdir(excel_root)
+        if f.endswith(".xlsx") and not f.startswith("~$")
+    ]
     if not excel_files:
         print(f"\n🛑 No Excel files found in '{excel_root}'.")
         return
@@ -145,17 +149,15 @@ def main():
     for i, f in enumerate(excel_files):
         print(f"[{i+1}] {f}")
 
-    choice_input = input("\nSelect file number: ")
-    if not choice_input.isdigit():
+    try:
+        choice = int(input("\nSelect file number: ")) - 1
+        if choice < 0 or choice >= len(excel_files):
+            raise ValueError
+        selected_excel = excel_files[choice]
+    except ValueError:
         print("Invalid selection.")
         return
 
-    choice = int(choice_input) - 1
-    if choice < 0 or choice >= len(excel_files):
-        print("Invalid selection.")
-        return
-
-    selected_excel = excel_files[choice]
     file_stem = os.path.splitext(selected_excel)[0]
 
     # Step 2: Locate Image Root
@@ -171,14 +173,20 @@ def main():
     is_test = input("Enable Single Test Mode? (Y/N): ").strip().lower() == "y"
 
     with open(DRIVE_CONFIG_FILE, "r") as f:
-        content = f.read().strip()
-        # 簡單過濾一下可能誤貼的註解
-        lines = content.split("\n")
-        drive_id = lines[0].strip()
-        for line in lines:
-            if line and not line.startswith("#"):
-                drive_id = line.strip()
-                break
+        # Read first non-empty line that isn't a comment
+        lines = f.read().splitlines()
+        drive_id = next(
+            (
+                line.strip()
+                for line in lines
+                if line.strip() and not line.startswith("#")
+            ),
+            None,
+        )
+
+    if not drive_id:
+        print("Error: No valid Drive ID found in drive_config.txt")
+        return
 
     date_in = input("Start Date (YYYY-MM-DD): ").strip()
     time_in = input("Start Time (HH:MM): ").strip()
@@ -206,15 +214,110 @@ def main():
     # Step 4: Run API and Processing
     service = get_drive_service()
     excel_path = os.path.join(excel_root, selected_excel)
+
+    # 載入 Excel 物件，準備讀取多個 Sheet
     xls = pd.ExcelFile(excel_path)
     final_rows, error_log = [], []
 
     print(f"\n🚀 Processing: {selected_excel}...")
 
-    df = pd.read_excel(excel_path, sheet_name=xls.sheet_names[0]).fillna("")
-    df.columns = df.columns.str.strip()
+    # [Modification 1] Loop through all sheets
+    for sheet_name in xls.sheet_names:
+        print(f"   📄 Reading Sheet: {sheet_name}...")
+        df = pd.read_excel(excel_path, sheet_name=sheet_name).fillna("")
+        df.columns = df.columns.str.strip()
 
-    # 定義標準 CSV 欄位順序
+        for idx, row in df.iterrows():
+            img_prefix = str(
+                row.get("Pin_Name_For_Upload") or row.get("Image_name")
+            ).strip()
+            row_errors = []
+
+            # Fuzzy Image Search
+            actual_img = None
+            if os.path.exists(image_dir):
+                for f in os.listdir(image_dir):
+                    if f.startswith(img_prefix) and f.lower().endswith(
+                        (".png", ".jpg", ".jpeg")
+                    ):
+                        actual_img = f
+                        break
+
+            # Fallback search by exact Image_name if prefix search fails
+            if not actual_img:
+                exact_name = str(row.get("Image_name", "")).strip()
+                if exact_name and os.path.exists(os.path.join(image_dir, exact_name)):
+                    actual_img = exact_name
+
+            if not actual_img:
+                row_errors.append(f"Image starting with '{img_prefix}' not found")
+
+            try:
+                # Handle Style ID (convert float to int string properly)
+                raw_sid = row.get("Applied_Style_ID", 0)
+                if isinstance(raw_sid, float):
+                    sid = int(raw_sid)
+                else:
+                    sid = int(float(str(raw_sid)))  # Handle string '1.0'
+
+                board = mapping.get(sid)
+                if not board:
+                    row_errors.append(f"Style ID {sid} missing in mapping")
+            except:
+                row_errors.append("Invalid Style ID")
+
+            if row_errors:
+                err_data = row.to_dict()
+                err_data["Sheet"] = sheet_name  # Add sheet info to error log
+                err_data["Failure_Reason"] = "; ".join(row_errors)
+                error_log.append(err_data)
+            else:
+                img_full_path = os.path.join(image_dir, actual_img)
+                url = upload_to_drive(service, img_full_path, actual_img, drive_id)
+                if url:
+                    # [Modification 3] Fixed CSV format (Added Thumbnail, changed Date format)
+                    final_rows.append(
+                        {
+                            "Title": str(row.get("Pin_Title")).strip(),
+                            "Media URL": url,
+                            "Pinterest board": board,
+                            "Thumbnail": "",  # Required by Pinterest Bulk Upload
+                            "Description": str(row.get("Pin_Description")).strip(),
+                            "Link": str(row.get("Affiliate_Link")).strip(),
+                            "Publish date": start_dt.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),  # Pinterest format
+                            "Keywords": str(row.get("Pin_Keywords")).strip(),
+                        }
+                    )
+                    start_dt += timedelta(minutes=interval)
+                else:
+                    err_data = row.to_dict()
+                    err_data["Sheet"] = sheet_name
+                    err_data["Failure_Reason"] = "Drive upload failed"
+                    error_log.append(err_data)
+
+            if is_test:
+                print(
+                    f"\n🧪 Single Test Mode: Process finished for row #1 in sheet {sheet_name}."
+                )
+                break
+
+        if is_test:
+            break
+
+    # Final Exports
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )  # [Modification 2] Generate timestamp
+
+    if error_log:
+        pd.DataFrame(error_log).to_excel(
+            os.path.join(output_dir, f"{file_stem}_update_{timestamp}.xlsx"),
+            index=False,
+        )
+
+    # Standard columns for Pinterest Bulk Upload
     csv_columns = [
         "Title",
         "Media URL",
@@ -226,98 +329,24 @@ def main():
         "Keywords",
     ]
 
-    for idx, row in df.iterrows():
-        img_prefix = str(
-            row.get("Pin_Name_For_Upload") or row.get("Image_name")
-        ).strip()
-        row_errors = []
-
-        # Fuzzy Image Search
-        actual_img = None
-        if os.path.exists(image_dir):
-            for f in os.listdir(image_dir):
-                if f.startswith(img_prefix) and f.lower().endswith(
-                    (".png", ".jpg", ".jpeg")
-                ):
-                    actual_img = f
-                    break
-
-        if not actual_img:
-            # 嘗試直接用 Image_name 找
-            backup_name = str(row.get("Image_name")).strip()
-            if backup_name and os.path.exists(os.path.join(image_dir, backup_name)):
-                actual_img = backup_name
-            else:
-                row_errors.append(f"Image starting with '{img_prefix}' not found")
-
-        try:
-            # 處理可能為浮點數的 ID
-            val = row.get("Applied_Style_ID", 0)
-            if isinstance(val, str):
-                if val.replace(".", "", 1).isdigit():
-                    sid = int(float(val))
-                else:
-                    sid = 0  # 無效
-            else:
-                sid = int(val)
-
-            board = mapping.get(sid)
-            if not board:
-                row_errors.append(f"Style ID {sid} missing in mapping")
-        except:
-            row_errors.append("Invalid Style ID")
-
-        if row_errors:
-            err_data = row.to_dict()
-            err_data["Failure_Reason"] = "; ".join(row_errors)
-            error_log.append(err_data)
-        else:
-            img_full_path = os.path.join(image_dir, actual_img)
-            url = upload_to_drive(service, img_full_path, actual_img, drive_id)
-            if url:
-                # [修正] 這裡確保鍵值對應標準欄位，並加入 Thumbnail
-                final_rows.append(
-                    {
-                        "Title": str(row.get("Pin_Title")).strip(),
-                        "Media URL": url,
-                        "Pinterest board": board,
-                        "Thumbnail": "",  # 依照格式要求留空
-                        "Description": str(row.get("Pin_Description")).strip(),
-                        "Link": str(row.get("Affiliate_Link")).strip(),
-                        # [修正] 日期格式改為 'YYYY-MM-DD HH:MM:SS'
-                        "Publish date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                        "Keywords": str(row.get("Pin_Keywords")).strip(),
-                    }
-                )
-                start_dt += timedelta(minutes=interval)
-            else:
-                err_data = row.to_dict()
-                err_data["Failure_Reason"] = "Drive upload failed"
-                error_log.append(err_data)
-
-        if is_test:
-            print("\n🧪 Single Test Mode: Process finished for row #1.")
-            break
-
-    # Final Exports
-    if error_log:
-        pd.DataFrame(error_log).to_excel(
-            os.path.join(output_dir, f"{file_stem}_update.xlsx"), index=False
-        )
     if final_rows:
         df_out = pd.DataFrame(final_rows)
-        # 確保按照 board 分組輸出
         for b_name, group in df_out.groupby("Pinterest board"):
             safe_b = "".join(x for x in b_name if x.isalnum() or x in " _").replace(
                 " ", "_"
             )
-            # [修正] 存檔時指定 columns 順序，確保符合 Pinterest Bulk Upload 格式
-            group[csv_columns].to_csv(
-                os.path.join(output_dir, f"upload_{safe_b}.csv"),
+            # [Modification 2] Add timestamp to filename
+            output_filename = f"upload_{timestamp}_{safe_b}.csv"
+
+            # [Modification 3] Ensure correct column order
+            group = group.reindex(columns=csv_columns, fill_value="")
+
+            group.to_csv(
+                os.path.join(output_dir, output_filename),
                 index=False,
                 encoding="utf-8-sig",
             )
-            print(f"✅ Created CSV for board '{b_name}'")
+            print(f"✅ Saved: {output_filename}")
 
     print(f"\n🎉 Finished. Check: {output_dir}")
 
