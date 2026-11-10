@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.env
+output/
+
+# generated
+*.jpg
+*.png
+Generated_Images/
+Generated_Content/
+backUp/
+
+
+# local copies of Google Fonts (re-create with: python src/localize_fonts.py)
+assets/fonts/
+
+# backups and logs
+data/*.bak_*
+logs/
