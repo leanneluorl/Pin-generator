@@ -1,0 +1,18 @@
+BOOK NOTES — 《不配得的迷宮》 / The Labyrinth of Unworthiness
+(final_proofread 讀這份檔案當作本書的事實表；作者可以自己改。英文照中文原稿；只有「還沒決定的原稿矛盾」才回報。)
+
+Fixed facts (the English must match these):
+- Money ledger and rendering rules are in the guidelines (全書金額對照表). Studio rent 35,000 = $3,500 a month; assistant's fee 40,000 = $4,000; balance 18,400 = $1,840 (chapter 200 balance 3,140 = $314).
+- Chapter 203 total shortfall: rent $3,500 + assistant $4,000 + other bills, minus the $1,840 balance, = $5,660 ("Total shortfall: $5,660"). Chapters 206 and 301 now say $5,660 (author-approved ChatGPT round 3); only 206's closing line "The gap of more than $5,000" stays, which is still true. The Chinese 203/206/301 still say "十天後" for both payments: the English shows rent in THREE days and the assistant's fee in TEN days — author to sync the Chinese.
+- Deadlines (author confirmed, NOT an inconsistency): the studio RENT is due in THREE days; the freelance assistant's fee is due in TEN days. "Three days" and "ten days" both appear on purpose. Never flag them.
+- Chapter 300: the $7,500 total is "upcoming expenses" (author, round 5; replaces the earlier "amount due"), never "the shortfall".
+- Chapter 204: Mark's credit card minimum payment is "about $800" in English (author decided, round 5; the Chinese says 八萬多 — the ledger check will flag it, ignore).
+- Chapter 303: the coffee costs $8.50 (eight one-dollar bills + a half-dollar coin, "Eight-fifty."). 303 opening: "As the light contracted" (收束), not faded.
+- Chapter 000 and from chapter 100 on: Renee carries TWO tokens (兩枚); the blank token (無字籌碼) appears later. (The author fixed chapter 000 to two.)
+- Clock times are numerals with a.m./p.m. (11:42 p.m.). The metal tokens are always "tokens"; the mother's coins are coins.
+- A "six-digit" NT$ balance (chapter 9900) is a "five-digit" US balance by the ledger. Do not change it to six-figure.
+- 分毫不差 on the ruler is always NOT A FRACTION OFF.
+- This is a FABLE. Legal documents, clauses and institutions (for example the paper in which Walter waives his duty to support his daughter, chapter 205) are the author's invention: translate them as written and NEVER question whether they would be valid, enforceable or realistic.
+
+Still undecided inside the Chinese manuscript (report as SOURCE:, do not "fix" the English):
+1. Where the blank token is kept: chapter 301 says the coat's inner lining pocket, chapter 303 says her trouser pocket.
