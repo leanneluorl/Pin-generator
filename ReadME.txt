@@ -35,7 +35,7 @@ pip install pandas google-genai openpyxl python-dotenv Pillow
 ├── .env (含 GEMINI_API_KEY)
 ├── Pinterest_Affiliate_Data.xlsx
 ├── product.xlsx
-└── /product_image
+└── /ref_images
     └── 71EtPSbLPnL._AC_SL1500_.jpg (所有產品圖片)
 
 
